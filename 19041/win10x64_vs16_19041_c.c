@@ -230,5 +230,36 @@ There is no guarantee that this will compile. Some re-ordering may/will be neces
 // Internals stuff via Process Hacker
 #define PHNT_MODE 1             // User
 #define PHNT_VERSION 109        // Version 2004 / 20H1 / 19041
+// These were added to avoid some redefinitions
 #define PHNT_STRINGS_DEFINED
-#include <phnt.h>
+#define PHNT_IP_GENERICS_DEFINED
+
+// #include <phnt.h>
+#include <phnt_ntdef.h>
+#include <ntnls.h>
+#include <ntkeapi.h>
+#include <ntldr.h>
+#include <ntexapi.h>
+#include <ntmmapi.h>
+#include <ntobapi.h>
+#include <ntpsapi.h>
+#include <cfg.h>
+#include <ntdbg.h>
+#include <ntioapi.h>
+#include <ntlpcapi.h>
+#include <ntpfapi.h>
+#include <ntpnpapi.h>
+#include <ntpoapi.h>
+#include <ntregapi.h>
+#include <ntrtl.h>
+#include <ntseapi.h>
+#include <nttmapi.h>
+#include <nttp.h>
+#include <ntxcapi.h>
+#include <ntwow64.h>
+#include <ntsam.h>
+#include <ntmisc.h>
+#include <ntzwapi.h>
+// Too much/complete? overlap in public headers
+// #include <ntd3dkmt.h>
+// #include <ntlsa.h>
