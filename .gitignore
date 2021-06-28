@@ -1,0 +1,7 @@
+.vs/*
+*.sln
+*.vcxproj*
+x64/*
+*.xml
+*.gdt
+*.i

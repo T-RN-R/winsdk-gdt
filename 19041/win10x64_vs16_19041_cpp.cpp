@@ -13,7 +13,7 @@ There is no guarantee that this will compile. Some re-ordering may/will be neces
 #define DIRECTINPUT_VERSION 0x800
 #define GDIPVER 0x110
 #define SECURITY_WIN32
-// #define WIN32 1
+#define WIN32 1
 #define _M_AMD64 100
 #define _M_X64 100
 #define _WIN64 1
@@ -36,7 +36,7 @@ typedef int _Bool;
 
 #define WINAPI_FAMILY WINAPI_FAMILY_DESKTOP_APP
 
-#define _interface class
+#define __interface struct
 
 #include <cstdlib>
 // Adding some undefined behaviour: disabling static assertions
@@ -49,6 +49,7 @@ typedef int _Bool;
 #include <winsock2.h>
 #include <windows.system.h>
 #include <windows.h>
+#include <stdio.h>
 #include <objidl.h>
 #include <comdef.h>
 #include <initguid.h>
@@ -61,7 +62,6 @@ typedef int _Bool;
 #include <atlbase.h>
 #include <atlcom.h>
 #include <atlcomcli.h>
-
 
 // API Headers
 #include "api_headers/active_directory_domain_services.h"
@@ -267,11 +267,41 @@ typedef int _Bool;
 #define PHNT_MODE 1             // User
 #define PHNT_VERSION 109        // Version 2004 / 20H1 / 19041
 #define PHNT_STRINGS_DEFINED
-#include <phnt.h>
+#define PHNT_IP_GENERICS_DEFINED
+
+// #include <phnt.h>
+#include <phnt_ntdef.h>
+#include <ntnls.h>
+#include <ntkeapi.h>
+#include <ntldr.h>
+#include <ntexapi.h>
+#include <ntmmapi.h>
+#include <ntobapi.h>
+#include <ntpsapi.h>
+#include <cfg.h>
+#include <ntdbg.h>
+#include <ntioapi.h>
+#include <ntlpcapi.h>
+#include <ntpfapi.h>
+#include <ntpnpapi.h>
+#include <ntpoapi.h>
+#include <ntregapi.h>
+#include <ntrtl.h>
+#include <ntseapi.h>
+#include <nttmapi.h>
+#include <nttp.h>
+#include <ntxcapi.h>
+#include <ntwow64.h>
+#include <ntsam.h>
+#include <ntmisc.h>
+#include <ntzwapi.h>
+// Too much/complete? overlap in public headers
+// #include <ntd3dkmt.h>
+// #include <ntlsa.h>
 
 // Compiler stuff
-#define BUILDING_C1XX_FORCEINCLUDE
-#include <ehdata_forceinclude.h>
+//#define BUILDING_C1XX_FORCEINCLUDE
+//#include <ehdata_forceinclude.h>
 
 // Jail
 // The alljoyn api unconditionally defines _DEBUG to use a crtdbg function

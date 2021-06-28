@@ -14,6 +14,7 @@ There is no guarantee that this will compile. Some re-ordering may/will be neces
 #define WIN32 1
 #define DIRECTINPUT_VERSION 0x800
 #define _AMD64_
+#define BUILD_WINDOWS
 
 #include <sdkddkver.h>
 

@@ -13,6 +13,7 @@ There is no guarantee that this will compile. Some re-ordering may be necessary.
 
 // API Headers
 #include <mswmdm.h>
+// Issue with const instead of #define
 #include <mtpext.h>
 #include <wmdmlog.h>
 
