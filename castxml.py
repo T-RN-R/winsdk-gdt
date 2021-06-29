@@ -18,7 +18,7 @@ DOTNET_SDK_DIR = pathlib.Path(
 MSVC_DIR = pathlib.Path(
     r"C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Tools\MSVC\14.29.30037"
 )
-CL_ARGS = f"/GS /GL /W3 /Gy /Zc:wchar_t /Gm- /Od /Ob0 /sdl /fp:precise /WX- /Gd /P /Oi /MD /GX /EHsc"
+CL_ARGS = f"/GS /GL /W3 /Gy /Zc:wchar_t /Gm- /Od /Ob0 /sdl /fp:precise /WX- /Gd /P /Oi /MD /GX /EHsc /d1reportAllClassLayout"
 CLANG_IGNORES = [
     "-Wno-deprecated-declarations",
     "-Wno-nonportable-include-path",
@@ -49,6 +49,7 @@ CLANG_IGNORES = [
     "-Wno-microsoft-explicit-constructor-call",
     "-Wno-deprecated-volatile",
     "-Wno-ambiguous-reversed-operator",
+    "-Wno-tautological-constant-out-of-range-compare"
 ]
 
 
@@ -65,14 +66,12 @@ def clang_sdk_includes(sdk_path):
         + f'-I"{sdk_path}\\cppwinrt"'
     )
 
-
 def clang_dotnet_sdk_includes(dotnet_sdk_path):
     return f'-I"{dotnet_sdk_path}\\um"'
 
 
 def clang_msvc_includes(msvc_dir):
     return f'-I"{msvc_dir}\\include" ' + f'-I"{msvc_dir}\\atlmfc\\include"'
-
 
 def invoke_castxml(
     src_files: typing.List[pathlib.Path],
@@ -82,6 +81,7 @@ def invoke_castxml(
     dotnet_sdk_dir: pathlib.Path,
     msvc_dir: pathlib.Path,
     extra_includes: typing.List[pathlib.Path],
+    skip_existing=False
 ):
     # cl.exe
     cl_bin = msvc_dir / "bin/Hostx64/x64/cl.exe"
@@ -92,10 +92,11 @@ def invoke_castxml(
         clang_extra_includes = " ".join(f'-I"{path}"' for path in extra_includes)
     clang_includes = (
         f"{clang_sdk_includes(sdk_dir)} "
-        + f"{clang_dotnet_sdk_includes(dotnet_sdk_dir)} "
         + f"{clang_msvc_includes(msvc_dir)} "
         + f"{clang_extra_includes}"
     )
+    if dotnet_sdk_dir:
+        clang_includes += f"{clang_dotnet_sdk_includes(dotnet_sdk_dir)}"
 
     # Warnings to ignore
     clang_ignores = ""
@@ -116,25 +117,22 @@ def invoke_castxml(
         "-ferror-limit=1",
         clang_includes,
         clang_ignores,
-        "--verbose"
     ])
 
     for src_file in src_files:
         out_file = src_file.with_suffix(".xml")
+        if out_file.exists() and skip_existing:
+            continue
         castxml_args = f'castxml.exe --castxml-cc-msvc-c ( "{cl_bin}" "{CL_ARGS}" ) --castxml-output=1 -o "{out_file}" "{src_file}" {clang_args}'
         print(castxml_args)
         castxml_proc = subprocess.Popen(
-            shlex.split(castxml_args), stdin=subprocess.PIPE, stderr=subprocess.PIPE
+            shlex.split(castxml_args), stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
         castxml_out, castxml_err = castxml_proc.communicate()
-        print(
-            str(castxml_err, encoding="utf-8") if castxml_err else "No stderr output."
-        )
-        print(
-            str(castxml_out, encoding="utf-8") if castxml_out else "No stdout output."
-        )
-
-
+        print(str(castxml_out, encoding="utf-8") if castxml_out else "No stdout output.")
+        if castxml_err:
+            raise CastXMLException(str(castxml_err, encoding="utf-8"))
+        
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-files", nargs="+", required=True)
