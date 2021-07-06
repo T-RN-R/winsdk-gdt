@@ -6,6 +6,8 @@ import shlex
 import subprocess
 import typing
 
+from collections import defaultdict
+
 SDK_DIR = pathlib.Path(r"C:\Program Files (x86)\Windows Kits\10\Include\10.0.19041.0")
 MSVC_DIR = pathlib.Path(
     r"C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Tools\MSVC\14.29.30037"
@@ -38,14 +40,18 @@ class ClException(Exception):
 
 def parse_class_layouts(raw):
     # Convert raw MSVC output from /d1reportAllClassLayout into json
-    class_pattern = re.compile("class\s+([^\s]+)\s+size\((\d+)\):\s*\t\+\-\-\-\s*(.+?)(?=\t\+\-\-\-)\t\+\-\-\-", flags=re.DOTALL)
+    class_pattern = re.compile("\nclass\s+(.+?)(?=\s+size)\s+size\((\d+)\):\s*\t\+\-\-\-(.+?)(?=\t\+\-\-\-)\t\+\-\-\-", flags=re.DOTALL)
     field_pattern = re.compile("(\d+).+(?:(?:\+\-\-\-)|(?:\|))(.*)")
-    vftable_pattern = re.compile("([^\:\s]+::\$vftable@[^\:]*):\s*(.+?)(?=\n\S)", flags=re.DOTALL)
-    class_defs = []
+    vftable_pattern = re.compile("((?:[^\n]+?)(?=\$vftable\@)[^\:]*):\s*(.+?)(?=\n[^\s\d])", flags=re.DOTALL)
+    classes = {}
+    vftables = {}
     raw_str = raw.decode('utf-8')
     
-    def parse_field_defs(fields_raw):
-        fields = []
+    def parse_field_defs(fields_raw, vftable=False):
+        if vftable:
+            fields = defaultdict(list)
+        else:
+            fields = {}
         for field_def in fields_raw.splitlines():
             if field_match := field_pattern.match(field_def.strip()):
                 field_offset = int(field_match.group(1))
@@ -53,30 +59,52 @@ def parse_class_layouts(raw):
                 if 'base class' in field_name:
                     # Skip base class entries in class definitions
                     continue
-                fields.append((field_offset, field_name))
+                field_name = fixup_msvc_name(field_name)
+                if vftable:
+                    # Vftable entries indicate their position in the table. Multiply by 8 to get their offset.
+                    field_offset = field_offset * 8
+                    fields[field_name].append(field_offset)
+                else:
+                    if ' ' in field_name:
+                        field_name = field_name.rsplit(' ')[1]
+                    fields[field_name] = field_offset
+                
         return fields
                 
+    def fixup_msvc_name(cname):
+        cname = re.sub('(struct|class|enum) ', '', cname)
+        cname = cname.replace(',', ', ').replace('> >', '>>')
+        cname = cname.replace(", 1", ", true").replace("1, ", "true, ").replace(", 0", ", false").replace("0, ", "false, ")
+        cname = cname.replace('__int64', 'long long').replace('HSTRING__', 'HSTRING')
+        return cname
+
     # Classes
     for match in class_pattern.findall(raw_str):
-        class_name = match[0]
+        class_name = fixup_msvc_name(match[0])
         class_size = int(match[1])
         fields_raw = match[2]
         if '<unnamed-tag>' in class_name:
             # Skip anonymous structs/unions in this output since we can't tell who they belong to :)
             continue
-        class_def = {'name': class_name, 'size': class_size, 'fields': parse_field_defs(fields_raw)}
-        class_defs.append(class_def)
+        class_def = {'size': class_size, 'fields': parse_field_defs(fields_raw)}
+        classes[class_name] = class_def
 
     # Vftables
     for match in vftable_pattern.findall(raw_str):
-        class_name = match[0]
-        fields_raw = match[1]
-        fields = parse_field_defs(fields_raw)
-        class_size = len(fields) * POINTER_SIZE
-        class_def = {'name': class_name, 'size': class_size, 'fields': fields}
-        class_defs.append(class_def)
+        # e.g. 'MyClass::$vftable@MyParent@'
+        full_table_name = match[0]
+        full_table_name = fixup_msvc_name(full_table_name)        
+        # e.g. 'MyClass'
+        class_name = full_table_name.rsplit("::", 1)[0]
+        methods_raw = match[1]
+        methods = parse_field_defs(methods_raw, vftable=True)
+        table_size = 0
+        for method_offsets in methods.values():
+            table_size += POINTER_SIZE * len(method_offsets)
+        table_def = {'name': full_table_name, 'size': table_size, 'fields': methods}
+        vftables[class_name] = table_def
 
-    return class_defs
+    return {'classes': classes, 'vftables': vftables}
 
 def dump_class_layouts(
     msvc_dir: pathlib.Path,
@@ -104,11 +132,11 @@ def dump_class_layouts(
         cl_out, cl_err = cl_proc.communicate()
         if cl_err:
             raise ClException(str(cl_err, encoding="utf-8"))
-        class_defs = parse_class_layouts(cl_out)
+        msvc_data = parse_class_layouts(cl_out)
         output_file.touch()
-        json.dump(class_defs, output_file.open('w'), indent=2)
+        json.dump(msvc_data, output_file.open('w'), indent=2)
         # debug file
-        # src_file.with_suffix('.classes.debug').write_text(str(cl_out, encoding="utf-8"))
+        src_file.with_suffix('.classes.debug').write_text(str(cl_out, encoding="utf-8"))
 
 def main():
     parser = argparse.ArgumentParser()

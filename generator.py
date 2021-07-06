@@ -17,6 +17,7 @@ BUILD_ROOT = SCRIPT_ROOT / "build"
 
 BASE_C_DEFS = """\
 // Base Requirements:
+#pragma warning(disable: 4117 4005)
 #define _AMD64_
 #define DIRECTINPUT_VERSION 0x800
 #include <sdkddkver.h>
@@ -25,7 +26,7 @@ BASE_C_DEFS = """\
 
 BASE_CPP_DEFS = """\
 // Base Requirements:
-#define __cplusplus
+#pragma warning(disable: 4117 4005)
 #define _AMD64_
 #define DIRECTINPUT_VERSION 0x800
 #define __STDCPP_DEFAULT_NEW_ALIGNMENT__ 16ull
@@ -110,6 +111,7 @@ def fixup_c_header(namespace, data):
     # Handle special cases
     data = NS_HANDLERS.get(namespace, null_ns_handler)(data)
 
+    # Mark where the parser should begin
     return data
 
 def fixup_cpp_header(namespace, data):
@@ -168,10 +170,9 @@ def create_gdt(data_dir:pathlib.Path, ghidra_dir: pathlib.Path):
         f"{headless_script.as_posix()} {BUILD_ROOT.as_posix()} tmp -preScript gdt.py {data_dir.as_posix()} -scriptPath {SCRIPT_ROOT.as_posix()}"
     )
     print(ghidra_args)
-    ghidra_proc = subprocess.Popen(ghidra_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    out, _ = ghidra_proc.communicate()
-    out_lines = out.decode('utf-8')
-    print(out_lines)    
+    ghidra_proc = subprocess.Popen(ghidra_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    for line in ghidra_proc.stdout:
+        print(line.decode('utf-8').strip())
 
 def main():
     parser = argparse.ArgumentParser()
@@ -208,7 +209,7 @@ def main():
 
     # Create output path
     if out_path.exists():
-        if out_path.parent.stem == PROJECT_NAME:
+        if out_path.parent.parent.stem == PROJECT_NAME:
             # Safe to delete. DEBUG: not deleting 
             # shutil.rmtree(out_path)
             pass

@@ -41,6 +41,35 @@ import xml.etree.ElementTree as ET
 import json
 import glob
 import os
+import re
+import traceback
+
+from collections import defaultdict
+
+
+class AnonymousCounters(object):
+
+    types = [
+        'enumeration',
+        'class',
+        'structure',
+        'union',
+        'function',
+        'method',
+    ]
+
+    def __init__(self):
+        self.counters = {
+            x:1 for x in self.types
+        }
+
+    def get(self, counterType):
+        counterType = counterType.lower()
+        value = self.counters[counterType]
+        self.counters[counterType] = self.counters[counterType] + 1
+        return value
+
+COUNTERS = AnonymousCounters()
 
 class GdtException(Exception):
     pass
@@ -53,18 +82,41 @@ class BaseType(object):
         self.manager = manager
         self.filePath = manager.getFileFromId(element.attrib.get('file', ''))
         self.categoryPath = manager.getCategoryPathFromFile(self.filePath)
-        # Check if we belong to a namespace
-        nsPrefix = ''
-        if 'context' in element.attrib:
-            ctxElement = manager.getElementById(element.attrib['context'])
-            if ctxElement.tag == "Namespace":
-                nsName = ctxElement.attrib['name']
-                if not nsName.endswith('::'):
-                    nsPrefix = nsName + '::'
-        defaultName = "anon_{0}_{1}".format(self.__class__.__name__, element.attrib['id'])
-        self.name = nsPrefix + element.attrib.get('name', defaultName.lower())
-        self.size = int(self.element.attrib.get('size', 0)) / 8   
+
+        def resolveNamespace(mgr, elmnt, prefix=''):
+            # Resolve our namespace name by recursing upward
+            if 'context' in elmnt.attrib:
+                ctxElement = mgr.getElementById(elmnt.attrib['context'])
+                if ctxElement.tag == "Namespace":
+                    nsName = ctxElement.attrib['name']
+                    if not nsName.endswith('::'):
+                        prefix = nsName + '::' + prefix
+                        # Recurse to prepend namespace parts from our ancestors
+                        return resolveNamespace(mgr, ctxElement, prefix)
+            return prefix
+
+        nsPrefix = resolveNamespace(manager, element)
+        elementName =  element.attrib.get('name', '')
+        classType = self.__class__.__name__.lower()
+        if not elementName and classType in AnonymousCounters.types:
+            # Anonymous entry, check category and add to anonymous if missing
+            if not self.categoryPath:
+                self.categoryPath = CategoryPath('/_anonymous_')
+            anonId = COUNTERS.get(classType)
+            elementName = "anon_{0}_{1}".format(classType, anonId)
+        self.name = self.msvc_name_fix(nsPrefix + elementName)
         self.alignment = int(self.element.attrib.get('align', 0)) / 8            
+
+    def msvc_name_fix(self, cname):
+        cname = cname.replace('HSTRING__', 'HSTRING').replace('HSTRING,', 'HSTRING *,').replace('HSTRING>', 'HSTRING *>')
+        cname = cname.replace('UINT32', 'unsigned int')
+        cname = re.sub('(struct|class|enum) ', '', cname)
+        cname = re.sub('(\<|(?:\, ))GUID', '\\1_GUID', cname)
+        # A bunch of annoying stuff where MSVC replaces the typedef but clang doesn't
+        cname = cname.replace('__FIVectorView_1_HSTRING_t', 'IVectorView<HSTRING *>')
+        cname = cname.replace('__FIVectorView_1_Windows__CData__CText__CTextSegment_t', 'IVectorView<ABI::Windows::Data::Text::TextSegment>')
+        cname = cname.replace('__FIMapView_2_HSTRING_IInspectable_t', 'IMapView<HSTRING *, IInspectable *>')
+        return cname
 
     def align(self):
         if self.alignment:
@@ -73,24 +125,13 @@ class BaseType(object):
             self.dataType.setToDefaultAligned()
 
     def save(self):
+        # print("Recording {} [{} bytes]".format(self.name, self.dataType.getLength()))
         self.manager.recordTypeForId(self.element.attrib['id'], self)
 
     def pad(self):
         if self.dataType.getLength() < self.size:
             padding = Undefined.getUndefinedDataType(self.size)
             self.dataType.add(padding, None, "Padding to match true size")
-
-    def getElement(self):
-        return self.element
-        
-    def setDataType(self, dataType):
-        self.dataType = dataType
-    
-    def getDataType(self):
-        return self.dataType
-    
-    def hasDataType(self):
-        return self.dataType != None
 
 class Array(BaseType):
     """
@@ -107,15 +148,10 @@ class Array(BaseType):
             raise Exception("No valid datatype for array. Specified type: " + arrayTypeId)
         maxIndex = element.attrib.get('max')
         maxIndex = int(maxIndex) if maxIndex != '' else 0
-        minIndex = element.attrib.get('min')
-        minIndex = int(minIndex) if minIndex != '' else 0
+        # We will create one-length for zero-length arrays, but the structure handler
+        # will set zero-length flex array based on our type
+        numElements = maxIndex or 1
         elementLength = arrayElementDataType.getLength()
-        numElements = (maxIndex - minIndex) + 1
-        if numElements == 0:
-            # FIXME: Ghidra won't accept 0 size arrays
-            # Setting it to 1 would consume more bytes than it may actually exist as.
-            # e.g. struct foobar baz[0] 
-            return Undefined.getUndefinedDataType(1)
         self.dataType = ArrayDataType(arrayElementDataType, numElements, elementLength)
         self.save()
 
@@ -127,10 +163,11 @@ class Enumeration(BaseType):
     """
     def __init__(self, element, manager):
         super(Enumeration, self).__init__(element, manager)
-        self.dataType = EnumDataType(self.categoryPath, self.enumName, self.size)
+        self.size = int(element.attrib["size"]) / 8
+        self.dataType = EnumDataType(self.categoryPath, self.name, self.size)
         for enumValue in element:
             name = enumValue.attrib['name']
-            bitSize = int(element.attrib['size'])
+            bitSize = int(element.attrib["size"])
             init = int(enumValue.attrib['init'])
             # Convert to signed integer as Java cannot coerce large unsigned numbers
             init = init & ((1 << bitSize) - 1)
@@ -145,8 +182,11 @@ class Function(BaseType):
             element (ElementTree): XML element
     """
     def __init__(self, element, manager):
-        super(Function, self).__init__(element, manager)           
-        self.dataType = FunctionDefinitionDataType(self.categoryPath, self.name)
+        super(Function, self).__init__(element, manager)
+        if self.categoryPath:    
+            self.dataType = FunctionDefinitionDataType(self.categoryPath, self.name)
+        else:
+            self.dataType = FunctionDefinitionDataType(self.name)
         returnTypeElement = manager.getElementById(element.attrib['returns'])
         returnType = manager.getDataType(returnTypeElement)
         self.dataType.setReturnType(returnType)
@@ -179,9 +219,9 @@ class Pointer(BaseType):
             print("Invalid DataType returned for PointerType: tag={0} id={1}".format(
                 pointeeElement.tag, pointeeElement.attrib['id'])
             )
-        pointerLength = manager.getDefaultPointerSize()
-        if 'size' in element.attrib:
-            pointerLength = int(element.attrib['size']) / 8
+        pointerLength = 8
+        if "size" in element.attrib:
+            pointerLength = int(element.attrib["size"]) / 8
         self.dataType = PointerDataType(pointeeDataType, pointerLength)
         self.save()
 
@@ -194,7 +234,12 @@ class Union(BaseType):
     """
     def __init__(self, element, manager):
         super(Union, self).__init__(element, manager)
-        self.dataType = UnionDataType(self.categoryPath, self.name, self.manager.dtMgr)
+        self.dataType = UnionDataType(self.categoryPath, self.name)
+        if "incomplete" in element.attrib:
+            self.size = 0
+        else:
+            self.size = int(element.attrib["size"]) / 8
+        self.flexible = False
         if 'members' in element.attrib:
             members = element.attrib['members']
             memberIds = members.split(" ")
@@ -206,8 +251,11 @@ class Union(BaseType):
                 fieldName = memberElement.attrib['name']
                 fieldDataType = manager.getDataType(fieldElement)
                 fieldOffset = int(memberElement.attrib['offset']) / 8
-                
+                if fieldElement.tag == "ArrayType" and 'min' in fieldElement.attrib and int(fieldElement.attrib["min"]) == 0:
+                    # Set flag that specifies we contain a flexible array
+                    self.flexible = True
                 self.dataType.add(fieldDataType, fieldName, hex(fieldOffset))
+        # print("Created Union {} [{} bytes]".format(self.name, self.dataType.getLength()))
         self.pad()
         self.save()
 
@@ -230,52 +278,55 @@ class Typedef(BaseType):
         self.dataType = TypedefDataType(self.categoryPath, self.name, underlyingDataType)
         self.save()
 
-class Class(BaseType):
+class Structure(BaseType):
     """
-    Convert CastXML XML element into a Ghidra StructureDataType.
-    Args:
-        element (ElementTree): XML element
+        Convert CastXML XML element into a Ghidra StructureDataType.    
+        Args:
+            element (ElementTree): XML element
     """
-
     def __init__(self, element, manager):
-        super(Class, self).__init__(element, manager)
-        self.dataType = StructureDataType(
-            self.categoryPath, self.name, self.size, manager.dtMgr
-        )
+        super(Structure, self).__init__(element, manager)
+        # Handle forward declarations
+        if "incomplete" in element.attrib:
+            self.size = 0
+        else:
+            self.size = int(element.attrib["size"]) / 8
+        
+        self.dataType = StructureDataType(self.categoryPath, self.name, self.size)
+        # print("Created {} [{} bytes]".format(self.name, self.size))
         self.align()
         self.save()
-        self.members = []
-        self.bases = []
-        self.virtualBases = []
-        self.virtualMethods = collections.OrderedDict()
-        self.inheritsVirtualMethods = False
-        self.instance = None
-        self.curOffset = 0
         self.curBitFieldOffset = -1
-        self.className = element.attrib["name"]
+        self.anonStructId = 0
+        self.anonUnionId = 0
+        self.bases = {}
+        self.methods = defaultdict(list)
+        
+        # This is our name without any namespace prepended
+        self.shortName = self.name
+        if ">" in self.shortName:
+            self.shortName = self.shortName.rsplit(">", 1)[0]
+        elif "::" in self.shortName:
+            self.shortName = self.shortName.rsplit('::', 1)[1]
 
+        print("Creating class {}".format(self.name))
         # Load all base classes
         if "bases" in element.attrib:
-            baseElements = element.getchildren()
-            for baseElement in baseElements:
-                # Get base information
-                baseTypeId = baseElement.attrib["type"]
-                baseClass = self.manager.getTypeById(baseTypeId)
-                if int(baseElement.attrib["virtual"]) == 1:
-                    self.virtualBases.append(baseClass)
-                else:
-                    self.bases.append(baseClass)
-                if baseClass.virtualMethods or baseClass.inheritsVirtualMethods:
-                    self.inheritsVirtualMethods = True
+            baseEntries = element.getchildren()
+            for baseEntry in baseEntries:
+                baseTypeId = baseEntry.attrib['type']
+                baseElement = manager.getElementById(baseTypeId)
+                # Get base information (this creates the classes if they don't already exist)
+                baseInternalType = manager.getInternalType(baseElement)
+                self.bases[baseInternalType.name] = baseInternalType
 
-        # Add each field
-        if "members" in element.attrib:
-            members = element.attrib["members"]
+        hasVirtualMethods = False
+        if 'members' in element.attrib:
+            members = element.attrib['members']
             memberIds = members.split(" ")
             for memberId in memberIds:
-                fieldElement = self.manager.getElementById(memberId)
-                # Skip artificial fields
-                if fieldElement.attrib.get("artificial") == "1":
+                fieldElement = manager.getElementById(memberId)
+                if fieldElement.attrib.get("artificial") == "1" and "overrides" not in fieldElement.attrib:
                     continue
                 # Methods
                 if fieldElement.tag in [
@@ -284,53 +335,275 @@ class Class(BaseType):
                     "Destructor",
                     "OperatorMethod",
                 ]:
-                    isVirtual = int(fieldElement.attrib["virtual"]) == 1
-                    methodType = self.createMethod(fieldElement)
-                    if isVirtual:
-                        # Split the class out from the name
-                        methodName = methodType.getName().split('::')[1]
-                        self.virtualMethods[methodName] = methodType
+                    methodDataType = self.createMethod(fieldElement)
+                    if fieldElement.tag == 'Destructor':
+                        methodName = '{dtor}'
+                    else:
+                        methodName = fieldElement.attrib['name']
+                    
+                    self.methods[methodName].append(methodDataType)
+                    hasVirtualMethods = True
                     continue
+
                 if fieldElement.tag != "Field":
                     continue
-                self.members.append(fieldElement)
+
+                # Fields representing other types (unions, arrays, etc.)
+                typeElement = self.manager.getElementById(fieldElement.attrib['type'])
+                fieldName = fieldElement.attrib['name']
+                fieldOffset = int(fieldElement.attrib['offset']) / 8
+                # Check for zero-sized flexible array at the end of the structure
+                if typeElement.tag == "ArrayType" and 'min' in typeElement.attrib and int(typeElement.attrib['min']) == 0:
+                    arrayElement = self.manager.getElementById(typeElement.attrib['type'])
+                    arrayDataType = self.manager.getDataType(arrayElement)
+                    self.dataType.setFlexibleArrayComponent(arrayDataType, fieldName, hex(fieldOffset))
+                else:
+                    if fieldOffset >= self.size:
+                        raise Exception("Structure {}, Field {} claims to be at offset {} which is beyond the container size {}".format(
+                            self.name, fieldName, hex(fieldOffset), hex(self.size)
+                        ))
+                    internalType = self.manager.getInternalType(typeElement)
+                    fieldDataType = self.manager.getDataType(typeElement)
+                    if "bits" in fieldElement.attrib:
+                        # Grab the storage size (in bytes) for this bitfield:
+                        storageSize = fieldDataType.getLength()
+                        # We need to use the base of the bitfield as the starting offset
+                        if self.curBitFieldOffset == -1 or fieldOffset >= self.curBitFieldOffset + storageSize:
+                            # First time seeing this bitfield
+                            self.curBitFieldOffset = fieldOffset
+
+                        # The offset of the current bit (in bits) and the number of bits it consumes
+                        bitOffset = (
+                            int(fieldElement.attrib["offset"]) - self.curBitFieldOffset * 8
+                        )
+                        bitSize = int(fieldElement.attrib["bits"])
+                        #print(
+                        #    "Processing bitfield member {}\n\tMember size (bits): {}\n\tMember offset in bitfield (bits): {}\n\t" \
+                        #    "Bitfield offset in structure (bytes): {}\n\tBitfield size (bytes): {}".format(
+                        #        fieldName, bitSize, bitOffset, self.curBitFieldOffset, storageSize
+                        #    )
+                        #)
+                        self.dataType.insertBitFieldAt(
+                            self.curBitFieldOffset,
+                            storageSize,
+                            bitOffset,
+                            fieldDataType,
+                            bitSize,
+                            fieldName,
+                            "",
+                        )
+                    else:
+                        # This might be an unnamed struct/union:
+                        if not fieldName:
+                            if typeElement.tag == "Struct":
+                                fieldName = 's' + str(self.anonStructId)
+                                self.anonStructId += 1
+                            elif typeElement.tag == "Union":
+                                fieldName = 'u' + str(self.anonUnionId)
+                                self.anonUnionId += 1
+                            else:
+                                raise GdtException("Structure {} has an unnamed field that isn't a struct or union. Id: {}".format(
+                                    self.name, memberId)
+                                )
+                        # print("Processing Struct:{} Field:{} Offset:{} ID: {}".format(
+                        #   self.name, fieldName, fieldOffset, memberId)
+                        # )
+                        # Check for flexible unions (MS)
+                        if isinstance(internalType, Union) and internalType.flexible:
+                            # We need to add extra bytes to the end of the struct for 1 instance of the union member size
+                            extraBytes = fieldDataType.getLength() - internalType.size
+                            self.dataType.growStructure(extraBytes)
+                        self.dataType.replaceAtOffset(fieldOffset, fieldDataType, fieldDataType.getLength(), fieldName, hex(fieldOffset))
+            
+        if hasVirtualMethods:
+            self.manager.classes.append(self)
+            
+    def createMethod(self, element):
+        global ANON_METHOD_COUNTER
+        """
+        Convert CastXML XML element into a Ghidra FunctionDefinitionDataType.
+
+        Args:
+            element (ElementTree): XML element
+
+        Returns (FunctionDefinitionDataType): Ghidra FunctionDefinitionDataType
+        """
+        params = []
+        argumentElements = element.getchildren()
+        varArgs = False
+        paramDataTypeNames = []
+        methodTag = element.tag
+        for i, argumentElement in enumerate(argumentElements):
+            if argumentElement.tag == "Argument":
+                argumentName = argumentElement.attrib.get("name", "arg_" + str(i))
+                argumentTypeElement = self.manager.getElementById(
+                    argumentElement.attrib["type"]
+                )
+                paramDataType = self.manager.getDataType(argumentTypeElement)
+                paramDataTypeNames.append(paramDataType.getName())
+                params.append(ParameterDefinitionImpl(argumentName, paramDataType, ""))
+            elif argumentElement.tag == "Elipsis":
+                varArgs = True
+        paramsSignature = "<" + ",".join(paramDataTypeNames or ["void"]) + ">"
+        if methodTag == 'Destructor':
+            methodName = '{dtor}'
+        elif methodTag == 'Constructor':
+            methodName = '{ctor}'
+        elif element.attrib['name'] != '':
+            methodName = element.attrib['name']
+        else:
+            methodName = "anon_method_" + ANON_METHOD_COUNTER
+            ANON_METHOD_COUNTER += 1
+        functionName = (
+            self.shortName
+            + "::"
+            + methodName
+            + paramsSignature
+        )
+        functionType = FunctionDefinitionDataType(self.categoryPath, functionName)
+        if "returns" in element.attrib:
+            returnTypeElement = self.manager.getElementById(element.attrib["returns"])
+            returnType = self.manager.getDataType(returnTypeElement)
+        else:
+            returnType = VoidDataType.dataType
+        functionType.setReturnType(returnType)
+        if varArgs:
+            functionType.setVarArgs(True)
+        functionType.setArguments(params)
+        # self.manager.recordTypeForId(element.attrib['id'], functionType)
+        return functionType 
+
+    def resolveBases(self):
+        # Resolve base class inheritance:
+        bases = self.bases.values()[:]
+        for base in bases:
+            base.resolveBases()
+            # Add bases of our bases to our bases!
+            self.bases.update(base.bases)
+
+    def resolveVftables(self):
+        # Sort out vftables
+        classData = self.manager.sourceUnit.classes.get(self.name)
+        vftable = self.manager.sourceUnit.vftables.get(self.name)
+        if not classData:
+            #print("No class data was retrieved for {}".format(self.name))
+            return
+        if not vftable:
+            #print("No vftable data was retrieved for {}".format(self.name))
+            return
+        
+        classFields = classData['fields']
+        # We need to keep track of our index in the function lists since the MSVC 
+        # d1reportAllClassLayout option doesn't print the full signature
+        methodIdxs = defaultdict(int)
+
+        for field, offset in classFields.items():
+            if 'vfptr' in field:
+                vftableName = vftable['name']
+                vftableDataType = StructureDataType(self.categoryPath, vftableName, vftable["size"])
+                vftablePointerType = PointerDataType(vftableDataType, 8)
+                for methodFullName, methodOffsets in vftable['fields'].items():
+                    methodParts = methodFullName.rsplit('::', 1)
+                    methodClass = methodParts[0][1:]
+                    methodName = methodParts[1]
+                    for methodOffset in methodOffsets:
+                        methodIdx = methodIdxs[methodFullName]
+                        methodIdxs[methodFullName] = methodIdxs[methodFullName] + 1
+                        if methodClass == self.name:
+                            if methodName not in self.methods:
+                                print("Missing method {} in {}: {}".format(methodName, self.name, self.methods))
+                                raise GdtException()
+                            methodDataType = self.methods[methodName][methodIdx]
+                        else:
+                            if methodClass not in self.bases:
+                                print("Missing base {} in {} bases: {}".format(methodClass, self.name, self.bases))
+                                raise GdtException()
+                            methodDataType = self.bases[methodClass].methods[methodName][methodIdx]
+                        methodPointerType = PointerDataType(methodDataType, 8)
+                        vftableDataType.replaceAtOffset(methodOffset, methodPointerType, 8, methodName, "")
+                self.dataType.replaceAtOffset(offset, vftablePointerType, 8, "vftable", "")
+
 
 class GDTTypeManager(object):
+
+    LOADABLE_TYPES = [
+        # Composite
+        "Class",
+        "Struct", 
+        "Union", 
+        # Typedefs
+        "Typedef", 
+        # Enums
+        "Enumeration",
+        # Functions
+        "Function"
+    ]
+
     def __init__(self, outputPath):
-        self.dtMgr = FileDataTypeManager.createFileArchive(File(outputPath))
+        if os.path.exists(outputPath):
+            self.dtMgr = FileDataTypeManager.openFileArchive(File(outputPath), True)
+        else:
+            self.dtMgr = FileDataTypeManager.createFileArchive(File(outputPath))
         self.transaction = None
         self.types = {}
         self.files = {}
         self.elements = {}
+        self.classes = []
         self.fundamentalTypes = {}
+        self.sourceUnit = None
 
-    def open(self):
+    def parse(self, sourceUnit):
         self.transaction = self.dtMgr.startTransaction("")
+        try:
+            print("Processing {}".format(sourceUnit.name))
+            self.sourceUnit = sourceUnit
+            self.types = {}
+            self.files = {}
+            self.elements = {}
+            self.classes = []
+            self.fundamentalTypes = {}
+            # Add files
+            for element in sourceUnit.xmlRoot:
+                elementId = element.attrib['id']
+                if element.tag == "File":
+                    self.files[elementId] = element
+                else:
+                    self.elements[elementId] = element
+            # Now parse elements
+            for element in sourceUnit.xmlRoot:
+                if element.tag in self.LOADABLE_TYPES:
+                    self.getDataType(element)
+            for classType in self.classes:
+                classType.resolveBases()
+                classType.resolveVftables()
+            for _, internalType in self.types.items():
+                self.dtMgr.resolve(internalType.dataType, DataTypeConflictHandler.KEEP_HANDLER)
+            self.dtMgr.endTransaction(self.transaction, True)
+            self.transaction = None
+            self.save()
+        except Exception as e:
+            print("Exception while processing {}:\n{}".format(sourceUnit.name, traceback.format_exc()))
+            raise e
+        except JavaException as je:
+            print("JavaException while processing {}:\n{}".format(sourceUnit.name, traceback.format_exc()))
+            raise je
+
 
     def close(self):
         if self.dtMgr:
             if self.transaction:
-                self.dtMgr.endTransaction(self.transaction, True)
+                self.dtMgr.endTransaction(self.transaction, False)
+            self.dtMgr.save()
             self.dtMgr.close()     
 
     def save(self):
-        self.dtMgr.endTransaction(self.transaction)
         self.dtMgr.save()
-        self.transaction = None
-
-    def getTypeById(self, id):
-        return self.types.get(id)
     
     def recordTypeForId(self, id, newType):
         self.types[id] = newType
 
     def getElementById(self, id):
         return self.elements.get(id)
-
-    def getDataTypeById(self, id):
-        if id not in self.types:
-            return None
-        return self.types[id].dataType
 
     def getFileFromId(self, id):
         if id not in self.files:
@@ -432,12 +705,22 @@ class GDTTypeManager(object):
 
         return self.fundamentalTypes[typeName]
 
+    def getInternalType(self, element):
+        internalType = self.types.get(element.attrib["id"])
+        if internalType != None:
+            return internalType
+        else:
+            self.createDataType(element)
+            return self.types.get(element.attrib["id"])
+
     def getDataType(self, element):
         # Return existing data types
-        dataType = self.getDataTypeById(element.attrib["id"])
-        if dataType != None:
-            return dataType
+        internalType = self.types.get(element.attrib["id"])
+        if internalType != None:
+            return internalType.dataType
+        return self.createDataType(element)
 
+    def createDataType(self, element):
         # Create new data type
         if element.tag == "FundamentalType":
             dataType = self.getFundamentalType(element)
@@ -454,7 +737,7 @@ class GDTTypeManager(object):
         elif element.tag == "Typedef":
             dataType = Typedef(element, self).dataType
         elif element.tag in ["Class", "Struct"]:
-            dataType = Class(element, self).dataType
+            dataType = Structure(element, self).dataType
         elif element.tag == "Union":
             dataType = Union(element, self).dataType
         elif element.tag == "Enumeration":
@@ -480,78 +763,51 @@ class GDTTypeManager(object):
         else:
             print("Encountered unhandled tag: {0}".format(element.tag))
             raise Exception()
-
-        # Since this is a new type, save it
-        if dataType != None:
-            self.dtMgr.resolve(dataType, DataTypeConflictHandler.REPLACE_EMPTY_STRUCTS_OR_RENAME_AND_ADD_HANDLER)
         
         return dataType
 
 class SourceUnit(object):
-    def __init__(self, unitName, xmlFile, jsonFile, manager):
-        self.manager = manager
+    def __init__(self, unitName, xmlFile, jsonFile):
         self.name = unitName
         self.xmlFile = xmlFile
         self.jsonFile = jsonFile
         self.xmlData = ET.parse(self.xmlFile)
+        self.xmlRoot = self.xmlData.getroot()
         with open(self.jsonFile, 'r') as fh:
-            self.classes = json.load(fh)
-
-    def parse(self, parsedTypes, gdtManager):
-        print("Processing {}".format(self.name))
-        try:
-            self.manager.open()
-            loadableTypes = (
-                # Composite
-                "Class",
-                "Struct", 
-                "Union", 
-                # Typedefs
-                "Typedef", 
-                # Enums
-                "Enumeration",
-                # Functions
-                "Function"
-            )
-            # Add files
-            for element in self.xmlData.root:
-                elementId = element.attrib['id']
-                if element.tag == "File":
-                    self.manager.files[elementId] = element
-                else:
-                    self.manager.elements[elementId] = element
-            
-            # Now parse elements
-            for element in self.xmlData.root:
-                if element.tag in loadableTypes:
-                    self.manager.getDataType(element)
-            self.manager.save()
-        except Exception as e:
-            print("Exception while processing {}:\n{}".format(self.name, e))
-        finally:
-            self.manager.close()
+            msvcData = json.load(fh)
+            self.classes = msvcData['classes']
+            self.vftables = msvcData['vftables']
 
 def main():
     args = getScriptArgs()
     dataDir = args[0]
     print("\n**** GDT Creation Script ****")
     print("Processing files in data directory: {}".format(dataDir))
-    outputPath = os.path.join(dataDir, 'output.gdt')
-    # There should be one xml and json for each processed source unit
-    sourceUnits = []
-    for xmlFile in glob.glob(dataDir + '/*.xml'):
-        # Parse the source unit e.g. my/path/target.xml becomes target
-        sourceUnit = os.path.split(xmlFile)[1].rsplit('.')[0]
-        jsonFile = dataDir + '/{}.classes.json'.format(sourceUnit)
-        if not os.path.exists(jsonFile):
-            print("ERROR: missing expected file: {}".format(jsonFile))
-            raise GdtException()
-        sourceUnits.append(SourceUnit(xmlFile, jsonFile))
-    gdtManager = GDTTypeManager(outputPath)
-    parsedTypes = {}
-    for sourceUnit in sourceUnits:
-        sourceUnit.parse(parsedTypes, gdtManager)
-    gdtManager.close()
+    outputPath = dataDir + '/_WindowsSDK_.gdt'.format(dataDir)
+    if os.path.exists(outputPath):
+        os.unlink(outputPath)
+    try:
+        # There should be one xml and json for each processed source unit
+        #for xmlFile in [os.path.join(dataDir, 'AllJoyn.xml')]:
+        for xmlFile in glob.glob(dataDir + '/*.xml'):
+            gdtManager = GDTTypeManager(outputPath)
+            # Parse the source unit e.g. my/path/target.xml becomes target
+            sourceUnitName = os.path.split(xmlFile)[1].rsplit('.')[0]
+            jsonFile = dataDir + '/{}.classes.json'.format(sourceUnitName)
+            if not os.path.exists(jsonFile):
+                print("ERROR: missing expected file: {}".format(jsonFile))
+                raise GdtException()
+            print("Parsing source unit: {}".format(sourceUnitName))
+            sourceUnit = (SourceUnit(sourceUnitName, xmlFile, jsonFile))
+            gdtManager.parse(sourceUnit)
+            gdtManager.close()
+        print("Wrote file {}".format(outputPath))
+    except Exception as e:
+        print("Error parsing source units: {}".format(e))
+        gdtManager.close()
+    except JavaException as je:
+        print("Java exception while parsing source units: {}".format(je))
+        gdtManager.close()
 
 if __name__ == "__main__":
     main()
