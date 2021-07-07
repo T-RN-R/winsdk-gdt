@@ -1,7 +1,13 @@
-.vs/*
+.vs*
+.vscode*
+__pycache__*
 *.sln
 *.vcxproj*
 x64/*
 *.xml
 *.gdt
 *.i
+*.obj
+*.pdb
+build/*
+sdk/*
