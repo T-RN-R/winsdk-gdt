@@ -297,6 +297,7 @@ class Structure(BaseType):
         self.align()
         self.save()
         self.curBitFieldOffset = -1
+        self.curBitFieldStorageSize = 0
         self.anonStructId = 0
         self.anonUnionId = 0
         self.bases = {}
@@ -366,26 +367,29 @@ class Structure(BaseType):
                     fieldDataType = self.manager.getDataType(typeElement)
                     if "bits" in fieldElement.attrib:
                         # Grab the storage size (in bytes) for this bitfield:
-                        storageSize = fieldDataType.getLength()
-                        # We need to use the base of the bitfield as the starting offset
-                        if self.curBitFieldOffset == -1 or fieldOffset >= self.curBitFieldOffset + storageSize:
+                        fieldStorageSize = fieldDataType.getLength()
+                        
+                        # Figure out which byte within the structure this bitfield starts on
+                        if self.curBitFieldOffset == -1 or \
+                           fieldOffset >= self.curBitFieldOffset + self.curBitFieldStorageSize:
                             # First time seeing this bitfield
                             self.curBitFieldOffset = fieldOffset
+                            self.curBitFieldStorageSize = fieldStorageSize
 
                         # The offset of the current bit (in bits) and the number of bits it consumes
                         bitOffset = (
                             int(fieldElement.attrib["offset"]) - self.curBitFieldOffset * 8
                         )
                         bitSize = int(fieldElement.attrib["bits"])
-                        #print(
-                        #    "Processing bitfield member {}\n\tMember size (bits): {}\n\tMember offset in bitfield (bits): {}\n\t" \
-                        #    "Bitfield offset in structure (bytes): {}\n\tBitfield size (bytes): {}".format(
-                        #        fieldName, bitSize, bitOffset, self.curBitFieldOffset, storageSize
-                        #    )
-                        #)
+                        print(
+                           "Processing bitfield member {}\n\tMember size (bits): {}\n\tMember offset in bitfield (bits): {}\n\t" \
+                           "Bitfield offset in structure (bytes): {}\n\tBitfield size (bytes): {}".format(
+                               fieldName, bitSize, bitOffset, self.curBitFieldOffset, self.curBitFieldStorageSize
+                           )
+                        )
                         self.dataType.insertBitFieldAt(
                             self.curBitFieldOffset,
-                            storageSize,
+                            self.curBitFieldStorageSize,
                             bitOffset,
                             fieldDataType,
                             bitSize,
@@ -784,11 +788,12 @@ def main():
     print("\n**** GDT Creation Script ****")
     print("Processing files in data directory: {}".format(dataDir))
     outputPath = dataDir + '/_WindowsSDK_.gdt'.format(dataDir)
-    if os.path.exists(outputPath):
-        os.unlink(outputPath)
+    # Just append to the GDT if it already exists..
+    #if os.path.exists(outputPath):
+    #    os.unlink(outputPath)
     try:
         # There should be one xml and json for each processed source unit
-        #for xmlFile in [os.path.join(dataDir, 'AllJoyn.xml')]:
+        #for xmlFile in [os.path.join(dataDir, 'ProcessHacker.xml')]:
         for xmlFile in glob.glob(dataDir + '/*.xml'):
             gdtManager = GDTTypeManager(outputPath)
             # Parse the source unit e.g. my/path/target.xml becomes target

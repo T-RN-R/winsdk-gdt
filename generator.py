@@ -13,7 +13,12 @@ PROJECT_NAME = 'winsdk-gdt'
 SCRIPT_ROOT = pathlib.Path(__name__).parent.absolute()
 SDK_ROOT = SCRIPT_ROOT / 'sdk'
 MD_ROOT = SCRIPT_ROOT / "win32metadata/generation/scraper/Partitions"
+PHNT_ROOT = SCRIPT_ROOT / "processhacker/phnt/include"
 BUILD_ROOT = SCRIPT_ROOT / "build"
+CPP_MODE = 'cpp'
+C_MODE = 'c'
+CPP_SDK_DIR = 'sdk_cpp'
+C_SDK_DIR = 'sdk_c'
 
 BASE_C_DEFS = """\
 // Base Requirements:
@@ -40,6 +45,20 @@ typedef int _Bool;
 #include <sdkddkver.h>
 """
 
+PHNT_CPP = """
+#include "_basedefs.hpp"
+#define PHNT_VERSION 111
+#include <phnt_windows.h>
+#include <phnt.h>
+"""
+
+PHNT_C = """
+#include "_basedefs.h"
+#define PHNT_VERSION 111
+#include <phnt_windows.h>
+#include <phnt.h>
+"""
+
 class GeneratorException(Exception):
     pass
 
@@ -54,22 +73,21 @@ def generate_header(folder: pathlib.Path):
     include_data = re.sub('"windows.fixed.h"', '<windows.h>', include_data)
     return include_data
     
-def parse_win32metadata(out_path: pathlib.Path):
-    # Parse each namespace in the partitions folder
-    c_headers = []
-    cpp_headers = []
-    c_headers_dir = out_path / "sdk_c"
-    cpp_headers_dir = out_path / "sdk_cpp"
-    c_headers_dir.mkdir(exist_ok=True)
-    cpp_headers_dir.mkdir(exist_ok=True)
+def parse_win32metadata(out_path: pathlib.Path, mode: str):
+    """Parse each namespace in the partitions folder"""
 
     # Write our base defs header
-    c_base_defs = c_headers_dir / '_basedefs.h'
-    c_base_defs.write_text(BASE_C_DEFS)
+    if mode == CPP_MODE:
+        base_defs = out_path / '_basedefs.hpp'
+        base_defs.write_text(BASE_CPP_DEFS)
+        suffix = 'cpp'
+        fixup = fixup_cpp_header
+    else:
+        base_defs = out_path / '_basedefs.h'
+        base_defs.write_text(BASE_C_DEFS)
+        suffix = 'c'
+        fixup = fixup_c_header
     
-    cpp_base_defs = cpp_headers_dir / '_basedefs.hpp'
-    cpp_base_defs.write_text(BASE_CPP_DEFS)
-
     for child in MD_ROOT.glob("*"):
         if not child.is_dir():
             continue
@@ -80,24 +98,11 @@ def parse_win32metadata(out_path: pathlib.Path):
         header_data = generate_header(child)
         
         # Write out the data to the 'sdk' directories (within the output directory)
-        c_header_name = f"{namespace}.c"
-        cpp_header_name = f"{namespace}.cpp"
+        header_name = f"{namespace}.{suffix}"
         
         # Some of the SDK headers are NOT C-compatible. 
-        c_header_path = c_headers_dir / c_header_name
-        c_header_path.write_text(fixup_c_header(namespace, header_data))
-
-        # They are expected to be C++ compatible as-is
-        cpp_header_path = cpp_headers_dir / cpp_header_name
-        cpp_header_path.write_text(fixup_cpp_header(namespace, header_data))
-
-        c_header_path_short = '\\'.join(c_header_path.parts[-2:])
-        c_headers.append(str(c_header_path_short))
-        cpp_header_path_short = '\\'.join(cpp_header_path.parts[-2:])
-        cpp_headers.append(str(cpp_header_path_short))
-        
-    c_headers = '\n'.join(f'#include "{x}"' for x in c_headers)
-    cpp_headers = '\n'.join(f'#include "{x}"' for x in cpp_headers)
+        header_path = out_path / header_name
+        header_path.write_text(fixup(namespace, header_data))
 
 def fixup_c_header(namespace, data):
     # Remove headers we know to be C++ only
@@ -118,13 +123,14 @@ def fixup_cpp_header(namespace, data):
     data = '#include "_basedefs.hpp"\n\n'  + data
     return data
 
-def parse_sdk(inc_dir: pathlib.Path, sdk_dir: pathlib.Path, msvc_dir: pathlib.Path, is_cpp=False):
+def parse_sdk(inc_dir: pathlib.Path, sdk_dir: pathlib.Path, msvc_dir: pathlib.Path, mode, extra_includes):
     
     # Feed the SDK files into castxml
-    if is_cpp:
-        src_files = list(inc_dir.glob('sdk_cpp/*.cpp'))
+    if is_cpp:= mode == CPP_MODE:
+        src_files = list(inc_dir.glob('*.cpp'))
     else:
-        src_files = list(inc_dir.glob('sdk_c/*.c'))
+        src_files = list(inc_dir.glob('*.c'))
+
     castxml.invoke_castxml(
         src_files=src_files,
         mode=castxml.Mode.USER,
@@ -132,7 +138,7 @@ def parse_sdk(inc_dir: pathlib.Path, sdk_dir: pathlib.Path, msvc_dir: pathlib.Pa
         sdk_dir=sdk_dir,
         dotnet_sdk_dir=None,
         msvc_dir=msvc_dir,
-        extra_includes=[],
+        extra_includes=extra_includes,
         skip_existing=True
     )
 
@@ -180,6 +186,8 @@ def main():
     parser.add_argument('--msvc-dir', help=r'MSVC Root e.g. "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Tools\MSVC\14.29.30037"', required=True)
     parser.add_argument('--ghidra-dir', help=r'Ghidra installation directory (defaults to $GHIDRA_HOME)', required=False, default=None)
     parser.add_argument('--out', help=r'Output path for generated headers. Defaults to SDK version e.g. "10.0.19041.0".', required=False, default=None)
+    parser.add_argument('--phnt', help=r'Include the native API includes from ProcessHacker', action="store_true", required=False, default=False)
+    parser.add_argument('--mode', help=r'C or C++', choices=[C_MODE, CPP_MODE], default=CPP_MODE, required=False)
     args = parser.parse_args()
 
     # Check Ghidra
@@ -218,12 +226,25 @@ def main():
             print(f"Error: Output path already exists! Delete existing output directory first.")
             return
     out_path.mkdir(exist_ok=True)
-    
+    if args.mode == CPP_MODE:
+        data_dir = out_path / CPP_SDK_DIR
+    else:
+        data_dir = out_path / C_SDK_DIR
+    data_dir.mkdir(exist_ok=True)
+    extra_includes = []
+    if args.phnt:
+        extra_includes.append(PHNT_ROOT)
+        if args.mode == CPP_MODE:
+            phnt_src = data_dir / 'ProcessHacker.cpp'
+            phnt_src.write_text(PHNT_CPP)
+        else:
+            phnt_src = data_dir / 'ProcessHacker.c'
+            phnt_src.write_text(PHNT_C)
+
     # Parse
-    parse_win32metadata(out_path)
-    parse_sdk(out_path, sdk_dir, msvc_dir, is_cpp=True)
-    cpp_dir = out_path / 'sdk_cpp'
-    create_gdt(cpp_dir, ghidra_dir)
+    parse_win32metadata(data_dir, args.mode)
+    parse_sdk(data_dir, sdk_dir, msvc_dir, args.mode, extra_includes)
+    create_gdt(data_dir, ghidra_dir)
 
 CPP_ONLY = [
     'alljoyn_c\\\\autopinger.h',
