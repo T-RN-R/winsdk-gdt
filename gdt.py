@@ -71,6 +71,9 @@ class AnonymousCounters(object):
 
 COUNTERS = AnonymousCounters()
 
+# This is a cumulative map of names to types, updated during parsing.
+GDT_TYPES = {}
+
 class GdtException(Exception):
     pass
 
@@ -82,41 +85,19 @@ class BaseType(object):
         self.manager = manager
         self.filePath = manager.getFileFromId(element.attrib.get('file', ''))
         self.categoryPath = manager.getCategoryPathFromFile(self.filePath)
-
-        def resolveNamespace(mgr, elmnt, prefix=''):
-            # Resolve our namespace name by recursing upward
-            if 'context' in elmnt.attrib:
-                ctxElement = mgr.getElementById(elmnt.attrib['context'])
-                if ctxElement.tag == "Namespace":
-                    nsName = ctxElement.attrib['name']
-                    if not nsName.endswith('::'):
-                        prefix = nsName + '::' + prefix
-                        # Recurse to prepend namespace parts from our ancestors
-                        return resolveNamespace(mgr, ctxElement, prefix)
-            return prefix
-
-        nsPrefix = resolveNamespace(manager, element)
+        nsPrefix = manager.resolveNamespace(element)
         elementName =  element.attrib.get('name', '')
         classType = self.__class__.__name__.lower()
+        self.anonymous = False
         if not elementName and classType in AnonymousCounters.types:
             # Anonymous entry, check category and add to anonymous if missing
             if not self.categoryPath:
                 self.categoryPath = CategoryPath('/_anonymous_')
             anonId = COUNTERS.get(classType)
             elementName = "anon_{0}_{1}".format(classType, anonId)
-        self.name = self.msvc_name_fix(nsPrefix + elementName)
+            self.anonymous = True
+        self.name = manager.msvc_name_fix(nsPrefix + elementName)
         self.alignment = int(self.element.attrib.get('align', 0)) / 8            
-
-    def msvc_name_fix(self, cname):
-        cname = cname.replace('HSTRING__', 'HSTRING').replace('HSTRING,', 'HSTRING *,').replace('HSTRING>', 'HSTRING *>')
-        cname = cname.replace('UINT32', 'unsigned int')
-        cname = re.sub('(struct|class|enum) ', '', cname)
-        cname = re.sub('(\<|(?:\, ))GUID', '\\1_GUID', cname)
-        # A bunch of annoying stuff where MSVC replaces the typedef but clang doesn't
-        cname = cname.replace('__FIVectorView_1_HSTRING_t', 'IVectorView<HSTRING *>')
-        cname = cname.replace('__FIVectorView_1_Windows__CData__CText__CTextSegment_t', 'IVectorView<ABI::Windows::Data::Text::TextSegment>')
-        cname = cname.replace('__FIMapView_2_HSTRING_IInspectable_t', 'IMapView<HSTRING *, IInspectable *>')
-        return cname
 
     def align(self):
         if self.alignment:
@@ -566,6 +547,7 @@ class GDTTypeManager(object):
             self.elements = {}
             self.classes = []
             self.fundamentalTypes = {}
+            
             # Add files
             for element in sourceUnit.xmlRoot:
                 elementId = element.attrib['id']
@@ -573,15 +555,33 @@ class GDTTypeManager(object):
                     self.files[elementId] = element
                 else:
                     self.elements[elementId] = element
-            # Now parse elements
+            
+            # Now parse elements from headers within our traverse list
             for element in sourceUnit.xmlRoot:
+                # Don't parse types that aren't in our traverse list.
+                filePath = self.getFileFromId(element.attrib.get('file', ''))
+                if not filePath:
+                    continue
+                
+                hdrName = self.getFileNameFromPath(filePath)
+                if hdrName not in self.sourceUnit.traverse:
+                    continue
+                # This belongs to our namespace, parse it
                 if element.tag in self.LOADABLE_TYPES:
                     self.getDataType(element)
+            
+            # Handle base classes and vftables for classes added during parsing above
             for classType in self.classes:
                 classType.resolveBases()
                 classType.resolveVftables()
+
+            # Add types we created to the manager
             for _, internalType in self.types.items():
                 self.dtMgr.resolve(internalType.dataType, DataTypeConflictHandler.KEEP_HANDLER)
+                # Add the type to the cumulative map (if it has a name and isn't anonymous)
+                if internalType.name and not internalType.anonymous:
+                    GDT_TYPES[internalType.name] = internalType.dataType.getPathName()
+
             self.dtMgr.endTransaction(self.transaction, True)
             self.transaction = None
             self.save()
@@ -613,16 +613,21 @@ class GDTTypeManager(object):
         if id not in self.files:
             return None
         fileElement = self.files[id]
-        return fileElement.attrib["name"]
+        return fileElement.attrib["name"].lower()
+
+    def getFileNameFromPath(self, filePath):
+        fileName = filePath.replace("/", "\\")
+        fileName = fileName.split("\\")[-1]
+        return fileName.lower()
 
     def getCategoryPathFromFile(self, filePath):
         if not filePath:
             return None
         # make sure we use the same path separators
-        filePath = filePath.replace("/", "\\")
-        categoryPath = "/" + filePath.split("\\")[-1]
+        fileName = self.getFileNameFromPath(filePath)
+        categoryPath = "/" + fileName
         # print categoryPath
-        return CategoryPath(categoryPath)
+        return CategoryPath(categoryPath.lower())
 
     def getIntType(self, isUnsigned, size):
         if isUnsigned == True:
@@ -717,11 +722,52 @@ class GDTTypeManager(object):
             self.createDataType(element)
             return self.types.get(element.attrib["id"])
 
+    def resolveNamespace(self, element, prefix=''):
+        # Resolve namespace name by recursing upward
+        if 'context' in element.attrib:
+            ctxElement = self.getElementById(element.attrib['context'])
+            if ctxElement.tag == "Namespace":
+                nsName = ctxElement.attrib['name']
+                if not nsName.endswith('::'):
+                    prefix = nsName + '::' + prefix
+                    # Recurse to prepend namespace parts from ancestors
+                    return self.resolveNamespace(ctxElement, prefix)
+        return prefix
+
+    def msvc_name_fix(self, cname):
+        cname = cname.replace('HSTRING__', 'HSTRING').replace('HSTRING,', 'HSTRING *,').replace('HSTRING>', 'HSTRING *>')
+        cname = cname.replace('UINT32', 'unsigned int')
+        cname = re.sub('(struct|class|enum) ', '', cname)
+        cname = re.sub('(\<|(?:\, ))GUID', '\\1_GUID', cname)
+        # A bunch of annoying stuff where MSVC replaces the typedef but clang doesn't
+        cname = cname.replace('__FIVectorView_1_HSTRING_t', 'IVectorView<HSTRING *>')
+        cname = cname.replace('__FIVectorView_1_Windows__CData__CText__CTextSegment_t', 'IVectorView<ABI::Windows::Data::Text::TextSegment>')
+        cname = cname.replace('__FIMapView_2_HSTRING_IInspectable_t', 'IMapView<HSTRING *, IInspectable *>')
+        return cname
+
     def getDataType(self, element):
-        # Return existing data types
+        """ Returns existing types or creates new ones """
+        
+        # Check internal types for this parsing run
         internalType = self.types.get(element.attrib["id"])
         if internalType != None:
+            if internalType.dataType == None:
+                raise GdtException("Internal type for {} (id {}) is null..?".format(internalType.name, element.attrib["id"]))
             return internalType.dataType
+
+        # Do we know about this from a previous run?
+        elementName =  element.attrib.get('name', '')
+        if elementName:
+            nsPrefix = self.resolveNamespace(element)
+            elementName = self.msvc_name_fix(nsPrefix + elementName)
+            typeId = GDT_TYPES.get(elementName)
+            if typeId != None:
+                ghidraType = self.dtMgr.getDataType(typeId)
+                if ghidraType == None:
+                    raise GdtException("Ghidra type for {} (id {}) is null..?".format(elementName, typeId))
+                return ghidraType
+
+        # Must be a new type
         return self.createDataType(element)
 
     def createDataType(self, element):
@@ -771,21 +817,24 @@ class GDTTypeManager(object):
         return dataType
 
 class SourceUnit(object):
-    def __init__(self, unitName, xmlFile, jsonFile):
+    def __init__(self, unitName, xmlFile, classesFile, traverseFile):
         self.name = unitName
         self.xmlFile = xmlFile
-        self.jsonFile = jsonFile
+        self.classesFile = classesFile
+        self.traverseFile = traverseFile
         self.xmlData = ET.parse(self.xmlFile)
         self.xmlRoot = self.xmlData.getroot()
-        with open(self.jsonFile, 'r') as fh:
+        with open(self.classesFile, 'r') as fh:
             msvcData = json.load(fh)
             self.classes = msvcData['classes']
             self.vftables = msvcData['vftables']
+        with open(self.traverseFile, 'r') as fh:
+            self.traverse = [x.lower() for x in json.load(fh)]
 
 def main():
+    print("\n**** GDT Creation Script ****")
     args = getScriptArgs()
     dataDir = args[0]
-    print("\n**** GDT Creation Script ****")
     print("Processing files in data directory: {}".format(dataDir))
     outputPath = dataDir + '/_WindowsSDK_.gdt'.format(dataDir)
     # Just append to the GDT if it already exists..
@@ -798,15 +847,19 @@ def main():
             gdtManager = GDTTypeManager(outputPath)
             # Parse the source unit e.g. my/path/target.xml becomes target
             sourceUnitName = os.path.split(xmlFile)[1].rsplit('.')[0]
-            jsonFile = dataDir + '/{}.classes.json'.format(sourceUnitName)
-            if not os.path.exists(jsonFile):
-                print("ERROR: missing expected file: {}".format(jsonFile))
+            classesFile = dataDir + '/{}.classes.json'.format(sourceUnitName)
+            if not os.path.exists(classesFile):
+                print("ERROR: missing expected file: {}".format(classesFile))
+                raise GdtException()
+            traverseFile = dataDir + '/{}.traverse.json'.format(sourceUnitName)
+            if not os.path.exists(traverseFile):
+                print("ERROR: missing expected file: {}".format(traverseFile))
                 raise GdtException()
             print("Parsing source unit: {}".format(sourceUnitName))
-            sourceUnit = (SourceUnit(sourceUnitName, xmlFile, jsonFile))
+            sourceUnit = (SourceUnit(sourceUnitName, xmlFile, classesFile, traverseFile))
             gdtManager.parse(sourceUnit)
             gdtManager.close()
-        print("Wrote file {}".format(outputPath))
+            print("Wrote data to file {}".format(outputPath))
     except Exception as e:
         print("Error parsing source units: {}".format(e))
         gdtManager.close()

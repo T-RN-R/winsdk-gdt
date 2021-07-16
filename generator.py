@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import pathlib
 import re
@@ -59,6 +60,41 @@ PHNT_C = """
 #include <phnt.h>
 """
 
+PHNT_TRAVERSE = [
+    "ntpsapi.h",
+    "ntregapi.h",
+    "ntrtl.h",
+    "ntsam.h",
+    "ntseapi.h",
+    "ntsmss.h",
+    "nttmapi.h",
+    "nttp.h",
+    "ntwow64.h",
+    "ntxcapi.h",
+    "ntzwapi.h",
+    "phnt.h",
+    "phnt_ntdef.h",
+    "phnt_windows.h",
+    "subprocesstag.h",
+    "winsta.h",
+    "ntd3dkmt.h",
+    "ntdbg.h",
+    "ntexapi.h",
+    "ntgdi.h",
+    "ntioapi.h",
+    "ntkeapi.h",
+    "ntldr.h",
+    "ntlpcapi.h",
+    "ntmisc.h",
+    "ntmmapi.h",
+    "ntnls.h",
+    "ntobapi.h",
+    "ntpebteb.h",
+    "ntpfapi.h",
+    "ntpnpapi.h",
+    "ntpoapi.h"
+]
+
 class GeneratorException(Exception):
     pass
 
@@ -72,6 +108,16 @@ def generate_header(folder: pathlib.Path):
     include_data = re.sub('#include "intrinfix.h"', '', include_data)
     include_data = re.sub('"windows.fixed.h"', '<windows.h>', include_data)
     return include_data
+
+def generate_traverse(folder: pathlib.Path):
+    namespace = folder.stem
+    settings_file = folder / "settings.rsp"
+    if not settings_file.exists():
+        raise GeneratorException(f"Missing settings data for {namespace} ({folder})")
+    settings_data = settings_file.read_text()
+    # Scrape header names from the settings file, they are only included in the traverse list
+    traverse_list = re.findall('/((?:[^/]+?)(?=\.h\s)\.h)\s', settings_data)
+    return traverse_list
     
 def parse_win32metadata(out_path: pathlib.Path, mode: str):
     """Parse each namespace in the partitions folder"""
@@ -91,18 +137,26 @@ def parse_win32metadata(out_path: pathlib.Path, mode: str):
     for child in MD_ROOT.glob("*"):
         if not child.is_dir():
             continue
-        # This isn't a C++ namespace, it's just the "API"
+        # NOTE: This isn't a C++ namespace, it's just the "API"
         namespace = child.stem
 
-        # This is the data as provided by the win32metadata project (C++ compatible)
+        # This is the source file data (main.cpp in the namespace dir)
         header_data = generate_header(child)
-        
+
+        # This is the list of headers that belong to the namespace (from settings.rsp in the namespace dir)
+        traverse_list = generate_traverse(child)
+
         # Write out the data to the 'sdk' directories (within the output directory)
         header_name = f"{namespace}.{suffix}"
+        traverse_name = f"{namespace}.traverse.json"
         
-        # Some of the SDK headers are NOT C-compatible. 
+        # Some of the SDK headers are NOT C-compatible.. invoke fixup to omit them
         header_path = out_path / header_name
         header_path.write_text(fixup(namespace, header_data))
+
+        traverse_path = out_path / traverse_name
+        traverse_path.write_text(json.dumps(traverse_list))
+
 
 def fixup_c_header(namespace, data):
     # Remove headers we know to be C++ only
@@ -142,6 +196,9 @@ def parse_sdk(inc_dir: pathlib.Path, sdk_dir: pathlib.Path, msvc_dir: pathlib.Pa
         skip_existing=True
     )
 
+    # We want to output the list of headers that contain types for this namespace, as defined by
+    # the --traverse list in the partition folder from win32metadata
+
     # If C++, we also want to dump class layouts/vftable contents
     if is_cpp:
         if BUILD_ROOT.exists():
@@ -170,15 +227,28 @@ def create_gdt(data_dir:pathlib.Path, ghidra_dir: pathlib.Path):
         ghidra_dir (pathlib.Path): [description]
     """
 
-    # Jython 2.7
-    headless_script = ghidra_dir / 'support/analyzeHeadless.bat'
-    ghidra_args = shlex.split(
-        f"{headless_script.as_posix()} {BUILD_ROOT.as_posix()} tmp -preScript gdt.py {data_dir.as_posix()} -scriptPath {SCRIPT_ROOT.as_posix()}"
-    )
-    print(ghidra_args)
-    ghidra_proc = subprocess.Popen(ghidra_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    for line in ghidra_proc.stdout:
-        print(line.decode('utf-8').strip())
+    # Ghidra 10.0.1 needs you to be in the support directory..?
+    current_dir = os.getcwd()
+    support_dir = ghidra_dir / 'support'
+    print(support_dir)
+    os.chdir(str(support_dir.absolute()))
+    print(os.getcwd())
+
+    try:
+        # Jython 2.7
+        headless_script = support_dir / 'analyzeHeadless.bat'
+        # ghidra_args = shlex.split(
+        #     f"{headless_script.as_posix()} {BUILD_ROOT.as_posix()} tmp -preScript {GDT_SCRIPT.as_posix()} {data_dir.as_posix()} -scriptPath {SCRIPT_ROOT.as_posix()}"
+        # )
+        ghidra_args = shlex.split(
+            f"{headless_script.as_posix()} {BUILD_ROOT.as_posix()} tmp -scriptPath {SCRIPT_ROOT.as_posix()} -preScript gdt.py {data_dir.as_posix()}"
+        )
+        print(ghidra_args)
+        ghidra_proc = subprocess.Popen(ghidra_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        for line in ghidra_proc.stdout:
+            print(line.decode('utf-8').strip())
+    finally:
+        os.chdir(current_dir)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -234,12 +304,15 @@ def main():
     extra_includes = []
     if args.phnt:
         extra_includes.append(PHNT_ROOT)
+        # Prepend the PH files with '_' so they get processed first instead of potentially incomplete windows types
         if args.mode == CPP_MODE:
-            phnt_src = data_dir / 'ProcessHacker.cpp'
+            phnt_src = data_dir / '_ProcessHacker.cpp'
             phnt_src.write_text(PHNT_CPP)
         else:
-            phnt_src = data_dir / 'ProcessHacker.c'
+            phnt_src = data_dir / '_ProcessHacker.c'
             phnt_src.write_text(PHNT_C)
+        phnt_traverse = data_dir / '_ProcessHacker.traverse.json'
+        phnt_traverse.write_text(json.dumps(PHNT_TRAVERSE))
 
     # Parse
     parse_win32metadata(data_dir, args.mode)
