@@ -1,5 +1,6 @@
 import argparse
 import collections
+import copy
 import json
 import os
 import pathlib
@@ -16,8 +17,12 @@ class ConstantsException(Exception):
 class ParsedEnum(object):
     def __init__(self, name: str, data: dict):
         self.name = name
+        self.initial_data = data
         self.auto_populate = data.get("autoPopulate")
-        self.member_type = data.get("type", "int")
+        self.member_type = data.get("type")
+        if not self.member_type:
+            # Try our additional information with default to int
+            self.member_type = ENUM_SIZES.get(self.name, "int")
         self.flags = data.get("flags", False)
         self.finished = data.get("finished", False)
         if self.auto_populate:
@@ -37,6 +42,7 @@ class EnumParser(object):
     
     CASTS = [
         '(DWORD)',
+        '(LONG)',
         '(NTSTATUS)',
         '(int)',
         '(uint)',
@@ -110,9 +116,16 @@ class EnumParser(object):
     IGNORED_ENUMS = [
         'TEXT_STORY_ACTIVE_STATE',
         'DTTOPTS_iTextShadowTypeFlags', # This one exists as a real enum TEXTSHADOWTYPE
+        'INSTALLMODE', # Same, INSTALLMODE, REINSTALLMODE are enums..
     ]
 
-    def __init__(self, win32md_enums_json: pathlib.Path, include_dirs: list[pathlib.Path]):
+    def __init__(self, win32md_enums_json: pathlib.Path, include_dirs: list[pathlib.Path], output_dir: pathlib.Path):
+        enums_json_file = output_dir / 'parsed_enums.json'
+        #if enums_json_file.exists():
+        #    print(f"Parsed enums file {enums_json_file} already exists. Skipping parsing.")
+        #    return
+        
+        print(f"Parsing enums from {win32md_enums_json}")
         self.resolved_constants = {}
         self.parsed_enums: typing.Dict[str, ParsedEnum] = collections.OrderedDict()
         self.deferred_evaluations = collections.defaultdict(lambda: collections.defaultdict(str))
@@ -125,12 +138,24 @@ class EnumParser(object):
         # These are the headers we need to collect enums from (via win32metadata's enums.json)
         enum_entries = json.load(win32md_enums_json.open('r'))
         enum_entries.extend(EXTRA_ENUMS)
+        add_uses = []
         for enum_entry in enum_entries:
-            if enum_name := (enum_entry.get('name') or enum_entry.get('addUsesTo')):
+            if enum_name := enum_entry.get('name'):
                 if enum_name in self.IGNORED_ENUMS:
                     continue
                 parsed_enum = ParsedEnum(enum_name, enum_entry)
                 self.parsed_enums[enum_name] = parsed_enum
+            elif enum_name :=  enum_entry.get('addUsesTo'):
+                add_uses.append(enum_entry)
+        
+        # Add additional uses after all enums have been instantiated
+        for enum_entry in add_uses:
+            enum_name = enum_entry['addUsesTo']
+            # We'll create the enum if it doesn't exist - it *should* just be additional uses for known enums
+            parsed_enum = self.parsed_enums.get(enum_name, ParsedEnum(enum_name, enum_entry))
+            parsed_enum.uses.extend(enum_entry['uses'])
+
+        self.fix_inconsistencies()
 
         # Read all #defines from the sdk :o
         constants_json_file = BUILD_ROOT / 'constants.json'
@@ -167,20 +192,26 @@ class EnumParser(object):
                 if member['name'] in parsed_enum.members:
                     continue
                 
-                # Is there a value provided?
-                if "value" in member:
-                    constant_entry = {
-                        'name': member['name'],
-                        'value': member['value'],
-                        'header': ''
-                    }
-                else:
-                    # Resolve it ourselves..
-                    try:
-                        constant_entry = self.all_constants[member['name']]
-                    except Exception as e:
-                        print(f"Error: {e}")
+                member_value = member.get('value')
+                # They provide a value, but we'd prefer to know which header it came from
+                constant_entry = self.all_constants.get(member['name'])
+                if not constant_entry:
+                    if  "value" in member:
+                        constant_entry = {
+                            'name': member['name'],
+                            'value': member['value'],
+                            'header': '_unknown'
+                        }
+                    else:
+                        raise ConstantsException(f"Constant {member['name']} not found, and no value provided!")
+                elif member_value:
+                    # They already handled casts etc. just accept theirs
+                    constant_entry['value'] = member_value
                 
+                # Make sure we have a header for this enum.
+                if not parsed_enum.header:
+                    parsed_enum.header = constant_entry['header']
+
                 parsed_value = self.resolve(parsed_enum, constant_entry)
                 if parsed_value:
                     parsed_enum.members[member['name']] = parsed_value
@@ -207,16 +238,8 @@ class EnumParser(object):
                     found.append(constant_name)
             [self.deferred_evaluations.pop(x) for x in found]
 
-
-
-        enums_json_file = BUILD_ROOT / 'parsed_enums.json'
         dumped = [pe.dump() for pe in self.parsed_enums.values()]
         json.dump(dumped, enums_json_file.open('w'), indent=2)
-
-    def get_enum(self, name):
-        if name not in self.parsed_enums:
-            self.parsed_enums[name] = ParsedEnum(name)
-        return self.parsed_enums[name]
 
     def auto_populate(self, parsed_enum: ParsedEnum):
         # Check our constants for entries matching the filter
@@ -363,6 +386,28 @@ class EnumParser(object):
             return None
         return value
 
+    def fix_inconsistencies(self):
+        # Some inconsistency issues e.g. LZOPENFILE_STYLE needs to be a ushort for some methods but an int for others.
+        # Ghidra dislikes this.
+        for enum_name, fix_data in INCONSISTENCIES.items():
+            parsed_enum = self.parsed_enums[enum_name]
+            bad_size_idx = None
+            for bad_size_entry in fix_data['bad_sizes']:
+                for i,use in enumerate(parsed_enum.uses):
+                    if use.get(bad_size_entry['param'], '') == bad_size_entry['value']:
+                        bad_size_idx = i
+                        break
+                if bad_size_idx != None:
+                    bad_size_use = parsed_enum.uses.pop(bad_size_idx)
+                    new_enum_name = bad_size_entry['new_name']
+                    if new_enum_name not in self.parsed_enums:
+                        new_enum = self.parsed_enums[new_enum_name] = ParsedEnum(new_enum_name, parsed_enum.initial_data)
+                        new_enum.uses = []
+                        new_enum.member_type = bad_size_entry['new_type']
+                    else:
+                        new_enum = self.parsed_enums[new_enum_name]
+                    new_enum.uses.append(bad_size_use)
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--sdk-dir', help='Source file to preprocess', required=True)
@@ -379,7 +424,21 @@ def main():
         sdk_dir / 'winrt',
         sdk_dir / 'cppwinrt',
     ]
-    parser = EnumParser(ENUMS_JSON_PATH, sdk_includes)   
+    parser = EnumParser(ENUMS_JSON_PATH, sdk_includes, BUILD_ROOT)   
+
+
+INCONSISTENCIES = {
+    'LZOPENFILE_STYLE': {
+        'bad_sizes': [
+            {
+                'param': 'method',
+                'value': 'OpenFile',
+                'new_name': 'OPENFILE_STYLE',
+                'new_type': 'ulong'
+            }
+        ]
+    },
+}
 
 EXTRA_CONSTANTS = {
     'wingdi.h': [
@@ -410,7 +469,68 @@ EXTRA_CONSTANTS = {
     ],    
 }
 
+# Cases where the size isn't provided
+ENUM_SIZES = {
+    'IMAGE_DIRECTORY_ENTRY': 'ushort',
+    'LZOPENFILE_STYLE': 'ushort',
+    'DEVICE_CAPABILITIES': 'ushort',
+    'CREATE_FONT_PACKAGE_SUBSET_PLATFORM': 'ushort',
+    'CREATE_FONT_PACKAGE_SUBSET_ENCODING': 'ushort',
+    'INTERNET_PORT': 'ushort',
+    'REPORT_EVENT_TYPE': 'ushort',
+}
+
+# Enums for which the constants don't even exist, or are missing from win32metadata.
 EXTRA_ENUMS = [
+    {
+        "name": "PARAFORMAT_BORDERS",
+        "flags": True,
+        "type": "ushort",
+        "header": "richedit.h",
+        "autoPopulate": {
+            "filter": "__NONEXISTENT__",
+            "header": "richedit.h"
+        },
+    },
+    {
+        "name": "PARAFORMAT_SHADING_STYLE",
+        "flags": True,
+        "type": "ushort",
+        "header": "richedit.h",
+        "autoPopulate": {
+            "filter": "__NONEXISTENT__",
+            "header": "richedit.h"
+        },
+    },
+    {
+        "name": "PARAFORMAT_NUMBERING_STYLE",
+        "flags": True,
+        "type": "ushort",
+        "header": "richedit.h",
+        "autoPopulate": {
+            "filter": "__NONEXISTENT__",
+            "header": "richedit.h"
+        },
+    },
+    {
+        "name": "RICH_EDIT_GET_CONTEXT_MENU_SEL_TYPE",
+        "flags": True,
+        "type": "ushort",
+        "header": "richedit.h",
+        "autoPopulate": {
+            "filter": "__NONEXISTENT__",
+            "header": "richedit.h"
+        },
+    },
+    {
+        "name": "ETO_OPTIONS",
+        "flags": True,
+        "type": "uint",
+        "autoPopulate": {
+            "filter": "ETO_",
+            "header": "wingdi.h"
+        },
+    },
     {
         "name": "SECURITY_DESCRIPTOR_CONTROL",
         "type": "ushort",

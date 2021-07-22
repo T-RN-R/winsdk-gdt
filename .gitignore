@@ -5,7 +5,6 @@ __pycache__*
 *.vcxproj*
 x64/*
 *.xml
-*.gdt
 *.i
 *.obj
 *.pdb

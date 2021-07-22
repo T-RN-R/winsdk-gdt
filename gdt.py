@@ -33,6 +33,9 @@ from ghidra.program.model.data import PointerDataType
 from ghidra.program.model.data import DataTypeConflictHandler
 from ghidra.program.model.data import FileDataTypeManager
 
+from ghidra.program.database.data import PointerDB
+from ghidra.program.database.data import TypedefDB
+
 from java.io import File
 from java.lang import Exception as JavaException
 
@@ -73,6 +76,9 @@ COUNTERS = AnonymousCounters()
 
 # This is a cumulative map of names to types, updated during parsing.
 GDT_TYPES = {}
+ENUM_FUNCTION_MAP = defaultdict(dict)
+ENUM_STRUCT_MAP = defaultdict(dict)
+ANON_METHOD_COUNTER = 1
 
 class GdtException(Exception):
     pass
@@ -114,6 +120,24 @@ class BaseType(object):
             padding = Undefined.getUndefinedDataType(self.size)
             self.dataType.add(padding, None, "Padding to match true size")
 
+    def resolveEnumReplacementType(self, paramDataType, enumData):
+        checkType = paramDataType
+        if isinstance(checkType, TypedefDataType) or isinstance(checkType, TypedefDB):
+            print("Getting base type for typedef'd {}".format(checkType.getName()))
+            checkType = checkType.getBaseDataType()
+        if isinstance(checkType, PointerDataType) or isinstance(checkType, PointerDB):
+            enumType = enumData['pointer']
+        else:
+            enumType = enumData['type']
+        if enumType.getLength() != checkType.getLength():
+            raise GdtException("Invalid length for enumeration {} ({}). Needs to be {} (from type {})".format(
+                enumType.getName(),
+                enumType.getLength(),
+                checkType.getLength(),
+                checkType.__class__.__name__)
+            )
+        return enumType
+
 class Array(BaseType):
     """
         Convert CastXML XML element into a Ghidra ArrayDataType.    
@@ -146,9 +170,9 @@ class Enumeration(BaseType):
         super(Enumeration, self).__init__(element, manager)
         self.size = int(element.attrib["size"]) / 8
         self.dataType = EnumDataType(self.categoryPath, self.name, self.size)
+        bitSize = int(element.attrib["size"])
         for enumValue in element:
             name = enumValue.attrib['name']
-            bitSize = int(element.attrib["size"])
             init = int(enumValue.attrib['init'])
             # Convert to signed integer as Java cannot coerce large unsigned numbers
             init = init & ((1 << bitSize) - 1)
@@ -170,7 +194,12 @@ class Function(BaseType):
             self.dataType = FunctionDefinitionDataType(self.name)
         returnTypeElement = manager.getElementById(element.attrib['returns'])
         returnType = manager.getDataType(returnTypeElement)
-        self.dataType.setReturnType(returnType)
+        # Check if our return type is an enum (e.g., GetLastError)
+        enumMap = ENUM_FUNCTION_MAP.get(self.name, {})
+        enumData = enumMap.get('return')
+        if enumData:
+            returnType = self.resolveEnumReplacementType(returnType, enumData)
+        self.dataType.setReturnType(returnType)        
         params = []
         argumentElements = element.getchildren()
         for i, argumentElement in enumerate(argumentElements):
@@ -178,6 +207,10 @@ class Function(BaseType):
                 argumentName = argumentElement.attrib.get('name', "arg_" + str(i)) 
                 argumentTypeElement = manager.getElementById(argumentElement.attrib['type'])
                 paramDataType = manager.getDataType(argumentTypeElement)   
+                # If we know about this from our enum map, use this type
+                enumData = enumMap.get(argumentName)
+                if enumData:
+                    paramDataType = self.resolveEnumReplacementType(paramDataType, enumData)
                 params.append(ParameterDefinitionImpl(argumentName, paramDataType, ""))
             elif argumentElement.tag == "Elipsis":
                 self.dataType.setVarArgs(True)
@@ -290,8 +323,13 @@ class Structure(BaseType):
             self.shortName = self.shortName.rsplit(">", 1)[0]
         elif "::" in self.shortName:
             self.shortName = self.shortName.rsplit('::', 1)[1]
+        # This is from win32metadata, it's a map to any of our members that are an opaque type
+        # in the docs, but for which we've created an enumeration from #defined constants.
+        enumMap = ENUM_STRUCT_MAP.get(self.shortName, {})
+        if enumMap:
+            print("Found enumMap struct entry for {}".format(self.shortName))
 
-        print("Creating class {}".format(self.name))
+        # print("Creating class {}".format(self.name))
         # Load all base classes
         if "bases" in element.attrib:
             baseEntries = element.getchildren()
@@ -339,67 +377,80 @@ class Structure(BaseType):
                     arrayElement = self.manager.getElementById(typeElement.attrib['type'])
                     arrayDataType = self.manager.getDataType(arrayElement)
                     self.dataType.setFlexibleArrayComponent(arrayDataType, fieldName, hex(fieldOffset))
-                else:
-                    if fieldOffset >= self.size:
-                        raise Exception("Structure {}, Field {} claims to be at offset {} which is beyond the container size {}".format(
-                            self.name, fieldName, hex(fieldOffset), hex(self.size)
-                        ))
-                    internalType = self.manager.getInternalType(typeElement)
-                    fieldDataType = self.manager.getDataType(typeElement)
-                    if "bits" in fieldElement.attrib:
-                        # Grab the storage size (in bytes) for this bitfield:
-                        fieldStorageSize = fieldDataType.getLength()
-                        
-                        # Figure out which byte within the structure this bitfield starts on
-                        if self.curBitFieldOffset == -1 or \
-                           fieldOffset >= self.curBitFieldOffset + self.curBitFieldStorageSize:
-                            # First time seeing this bitfield
-                            self.curBitFieldOffset = fieldOffset
-                            self.curBitFieldStorageSize = fieldStorageSize
+                    continue
+                
+                # Non-array types
+                if fieldOffset >= self.size:
+                    raise Exception("Structure {}, Field {} claims to be at offset {} which is beyond the container size {}".format(
+                        self.name, fieldName, hex(fieldOffset), hex(self.size)
+                    ))
+                
+                internalType = self.manager.getInternalType(typeElement)
+                fieldDataType = self.manager.getDataType(typeElement)
+                if "bits" in fieldElement.attrib:
+                    # Grab the storage size (in bytes) for this bitfield:
+                    fieldStorageSize = fieldDataType.getLength()
+                    
+                    # Figure out which byte within the structure this bitfield starts on
+                    if self.curBitFieldOffset == -1 or \
+                        fieldOffset >= self.curBitFieldOffset + self.curBitFieldStorageSize:
+                        # First time seeing this bitfield
+                        self.curBitFieldOffset = fieldOffset
+                        self.curBitFieldStorageSize = fieldStorageSize
 
-                        # The offset of the current bit (in bits) and the number of bits it consumes
-                        bitOffset = (
-                            int(fieldElement.attrib["offset"]) - self.curBitFieldOffset * 8
-                        )
-                        bitSize = int(fieldElement.attrib["bits"])
-                        print(
-                           "Processing bitfield member {}\n\tMember size (bits): {}\n\tMember offset in bitfield (bits): {}\n\t" \
-                           "Bitfield offset in structure (bytes): {}\n\tBitfield size (bytes): {}".format(
-                               fieldName, bitSize, bitOffset, self.curBitFieldOffset, self.curBitFieldStorageSize
-                           )
-                        )
-                        self.dataType.insertBitFieldAt(
-                            self.curBitFieldOffset,
-                            self.curBitFieldStorageSize,
-                            bitOffset,
-                            fieldDataType,
-                            bitSize,
-                            fieldName,
-                            "",
-                        )
+                    # The offset of the current bit (in bits) and the number of bits it consumes
+                    bitOffset = (
+                        int(fieldElement.attrib["offset"]) - self.curBitFieldOffset * 8
+                    )
+                    bitSize = int(fieldElement.attrib["bits"])
+                    # print(
+                    #     "Processing bitfield member {}\n\tMember size (bits): {}\n\tMember offset in bitfield (bits): {}\n\t" \
+                    #     "Bitfield offset in structure (bytes): {}\n\tBitfield size (bytes): {}".format(
+                    #         fieldName, bitSize, bitOffset, self.curBitFieldOffset, self.curBitFieldStorageSize
+                    #     )
+                    # )
+                    self.dataType.insertBitFieldAt(
+                        self.curBitFieldOffset,
+                        self.curBitFieldStorageSize,
+                        bitOffset,
+                        fieldDataType,
+                        bitSize,
+                        fieldName,
+                        "",
+                    )
+                    continue
+                
+                # This might be an unnamed struct/union:
+                if not fieldName:
+                    if typeElement.tag == "Struct":
+                        fieldName = 's' + str(self.anonStructId)
+                        self.anonStructId += 1
+                    elif typeElement.tag == "Union":
+                        fieldName = 'u' + str(self.anonUnionId)
+                        self.anonUnionId += 1
                     else:
-                        # This might be an unnamed struct/union:
-                        if not fieldName:
-                            if typeElement.tag == "Struct":
-                                fieldName = 's' + str(self.anonStructId)
-                                self.anonStructId += 1
-                            elif typeElement.tag == "Union":
-                                fieldName = 'u' + str(self.anonUnionId)
-                                self.anonUnionId += 1
-                            else:
-                                raise GdtException("Structure {} has an unnamed field that isn't a struct or union. Id: {}".format(
-                                    self.name, memberId)
-                                )
-                        # print("Processing Struct:{} Field:{} Offset:{} ID: {}".format(
-                        #   self.name, fieldName, fieldOffset, memberId)
-                        # )
-                        # Check for flexible unions (MS)
-                        if isinstance(internalType, Union) and internalType.flexible:
-                            # We need to add extra bytes to the end of the struct for 1 instance of the union member size
-                            extraBytes = fieldDataType.getLength() - internalType.size
-                            self.dataType.growStructure(extraBytes)
-                        self.dataType.replaceAtOffset(fieldOffset, fieldDataType, fieldDataType.getLength(), fieldName, hex(fieldOffset))
-            
+                        raise GdtException("Structure {} has an unnamed field that isn't a struct or union. Id: {}".format(
+                            self.name, memberId)
+                        )
+                
+                # Check if we're known enumeration type
+                enumData = enumMap.get(fieldName)
+                if enumData:
+                    fieldDataType = self.resolveEnumReplacementType(fieldDataType, enumData)
+                # print("Processing Struct:{} Field:{} Offset:{} ID: {}".format(
+                #   self.name, fieldName, fieldOffset, memberId)
+                # )
+                # Check for flexible unions (MS)
+                if isinstance(internalType, Union) and internalType.flexible:
+                    # We need to add extra bytes to the end of the struct for 1 instance of the union member size
+                    extraBytes = fieldDataType.getLength() - internalType.size
+                    self.dataType.growStructure(extraBytes)
+                
+                
+                self.dataType.replaceAtOffset(fieldOffset, fieldDataType, fieldDataType.getLength(), fieldName, hex(fieldOffset))
+                
+
+    
         if hasVirtualMethods:
             self.manager.classes.append(self)
             
@@ -418,13 +469,19 @@ class Structure(BaseType):
         varArgs = False
         paramDataTypeNames = []
         methodTag = element.tag
+        methodName = element.attrib.get('name', '')
+        enumMap = ENUM_FUNCTION_MAP.get(methodName, {})
+        if enumMap:
+            print("Found enumMap function entry for {}".format(methodName))
         for i, argumentElement in enumerate(argumentElements):
             if argumentElement.tag == "Argument":
                 argumentName = argumentElement.attrib.get("name", "arg_" + str(i))
-                argumentTypeElement = self.manager.getElementById(
-                    argumentElement.attrib["type"]
-                )
+                argumentTypeElement = self.manager.getElementById(argumentElement.attrib["type"])
                 paramDataType = self.manager.getDataType(argumentTypeElement)
+                # If we know about this from our enum map, use this type
+                enumData = enumMap.get(argumentName)
+                if enumData:
+                    paramDataType = self.resolveEnumReplacementType(paramDataType, enumData)
                 paramDataTypeNames.append(paramDataType.getName())
                 params.append(ParameterDefinitionImpl(argumentName, paramDataType, ""))
             elif argumentElement.tag == "Elipsis":
@@ -434,9 +491,7 @@ class Structure(BaseType):
             methodName = '{dtor}'
         elif methodTag == 'Constructor':
             methodName = '{ctor}'
-        elif element.attrib['name'] != '':
-            methodName = element.attrib['name']
-        else:
+        elif not methodName:
             methodName = "anon_method_" + ANON_METHOD_COUNTER
             ANON_METHOD_COUNTER += 1
         functionName = (
@@ -451,6 +506,10 @@ class Structure(BaseType):
             returnType = self.manager.getDataType(returnTypeElement)
         else:
             returnType = VoidDataType.dataType
+        # Is the return type an enum (e.g., GetLastError)?
+        enumData = enumMap.get('return')
+        if enumData:
+            returnType = self.resolveEnumReplacementType(returnType, enumData)
         functionType.setReturnType(returnType)
         if varArgs:
             functionType.setVarArgs(True)
@@ -753,6 +812,7 @@ class GDTTypeManager(object):
         if internalType != None:
             if internalType.dataType == None:
                 raise GdtException("Internal type for {} (id {}) is null..?".format(internalType.name, element.attrib["id"]))
+            # print("Returning {} for id {}".format(internalType.name, element.attrib["id"]))
             return internalType.dataType
 
         # Do we know about this from a previous run?
@@ -765,6 +825,12 @@ class GDTTypeManager(object):
                 ghidraType = self.dtMgr.getDataType(typeId)
                 if ghidraType == None:
                     raise GdtException("Ghidra type for {} (id {}) is null..?".format(elementName, typeId))
+                # print("Returning stored datatype {} ({}) for element {} with id {}".format(
+                #    ghidraType.getName(),
+                #    ghidraType.__class__.__name__,
+                #    elementName, 
+                #    element.attrib["id"])
+                # )
                 return ghidraType
 
         # Must be a new type
@@ -831,6 +897,60 @@ class SourceUnit(object):
         with open(self.traverseFile, 'r') as fh:
             self.traverse = [x.lower() for x in json.load(fh)]
 
+def process_enums(enumsPath, outputPath):
+    member_sizes = {
+        'int': 32,
+        'uint': 32,
+        'long': 32,
+        'ulong': 32,
+        'ushort': 16,
+        'short': 16,
+        'byte': 8
+    }
+    # Add all of the enums to the GDT, and create a map of function_name: {param, enum} entries.
+    if not os.path.exists(enumsPath):
+        print("ERROR: missing expected file: {}".format(enumsPath))
+        raise GdtException()
+    with open(enumsPath, 'r') as fh:
+        enums = json.load(fh)
+    gdtManager = GDTTypeManager(outputPath)
+    transaction = gdtManager.dtMgr.startTransaction("")
+    for enum in enums:
+        if enum['header'] == None:
+            raise GdtException("Enum {} has no header!".format(enum['name']))
+        categoryPath =  CategoryPath('/' + enum['header'])
+        enumBitSize = member_sizes[enum['member_type']]
+        enumByteSize = enumBitSize/8
+        # Create the type and pointer type
+        enumDataType = EnumDataType(categoryPath, enum['name'], enumByteSize)
+        enumPointerDataType = PointerDataType(enumDataType, 8)
+        for memberName, memberValue in enum['members'].items():
+            # Convert to signed integer as Java cannot coerce large unsigned numbers
+            memberValue = memberValue & ((1 << enumBitSize) - 1)
+            memberValue = memberValue | (-(memberValue & (1 << (enumBitSize - 1))))
+            enumDataType.add(memberName, memberValue)
+        
+        # Add the types
+        gdtManager.dtMgr.resolve(enumDataType, DataTypeConflictHandler.KEEP_HANDLER)
+        gdtManager.dtMgr.resolve(enumPointerDataType, DataTypeConflictHandler.KEEP_HANDLER)
+    
+        # Save uses, when we parse functions we'll check this dict
+        for use in enum['uses']:
+            enumMethod = use.get('method')
+            enumStruct = use.get('struct')
+            if enumMethod:
+                ENUM_FUNCTION_MAP[enumMethod][use['parameter']] = {
+                    'type':enumDataType, 
+                    'pointer': enumPointerDataType
+                }
+            if enumStruct:
+                ENUM_STRUCT_MAP[enumStruct][use['field']] = {
+                    'type':enumDataType, 
+                    'pointer': enumPointerDataType
+                }
+    gdtManager.dtMgr.endTransaction(transaction, True)
+    gdtManager.dtMgr.close()
+
 def main():
     print("\n**** GDT Creation Script ****")
     args = getScriptArgs()
@@ -841,9 +961,20 @@ def main():
     #if os.path.exists(outputPath):
     #    os.unlink(outputPath)
     try:
+        # Prior to parsing any of the source files, makes sure all of the enums are added
+        enumsPath = dataDir + '/parsed_enums.json'
+        process_enums(enumsPath, outputPath)
+
         # There should be one xml and json for each processed source unit
-        #for xmlFile in [os.path.join(dataDir, 'ProcessHacker.xml')]:
-        for xmlFile in glob.glob(dataDir + '/*.xml'):
+        xmlFiles = list(glob.glob(dataDir + '/*.xml'))
+        # startUnit = 'WinProg.xml'
+        # while True:
+        #     x = xmlFiles[0]
+        #     if startUnit not in x:
+        #         xmlFiles.pop(0)
+        #         continue
+        #     break
+        for xmlFile in xmlFiles:
             gdtManager = GDTTypeManager(outputPath)
             # Parse the source unit e.g. my/path/target.xml becomes target
             sourceUnitName = os.path.split(xmlFile)[1].rsplit('.')[0]

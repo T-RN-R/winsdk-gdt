@@ -8,12 +8,14 @@ import shutil
 import subprocess
 
 import castxml
+import constants
 import msvc
 
 PROJECT_NAME = 'winsdk-gdt'
 SCRIPT_ROOT = pathlib.Path(__name__).parent.absolute()
 SDK_ROOT = SCRIPT_ROOT / 'sdk'
 MD_ROOT = SCRIPT_ROOT / "win32metadata/generation/scraper/Partitions"
+ENUMS_JSON_PATH = SCRIPT_ROOT / "win32metadata/generation/scraper/enums.json"
 PHNT_ROOT = SCRIPT_ROOT / "processhacker/phnt/include"
 BUILD_ROOT = SCRIPT_ROOT / "build"
 CPP_MODE = 'cpp'
@@ -250,6 +252,16 @@ def create_gdt(data_dir:pathlib.Path, ghidra_dir: pathlib.Path):
     finally:
         os.chdir(current_dir)
 
+def parse_constants(data_dir:pathlib.Path, sdk_dir: pathlib.Path):
+    sdk_dirs = [
+        sdk_dir / 'ucrt',
+        sdk_dir / 'um',
+        sdk_dir / 'shared',
+        sdk_dir / 'winrt',
+        sdk_dir / 'cppwinrt',
+    ]
+    constants.EnumParser(ENUMS_JSON_PATH, sdk_dirs, data_dir)
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--sdk-dir', help=r'SDK Root e.g. "C:\Program Files (x86)\Windows Kits\10\Include\10.0.19041.0"', required=True)
@@ -306,17 +318,18 @@ def main():
         extra_includes.append(PHNT_ROOT)
         # Prepend the PH files with '_' so they get processed first instead of potentially incomplete windows types
         if args.mode == CPP_MODE:
-            phnt_src = data_dir / '_ProcessHacker.cpp'
+            phnt_src = data_dir / '0ProcessHacker.cpp'
             phnt_src.write_text(PHNT_CPP)
         else:
-            phnt_src = data_dir / '_ProcessHacker.c'
+            phnt_src = data_dir / '0ProcessHacker.c'
             phnt_src.write_text(PHNT_C)
-        phnt_traverse = data_dir / '_ProcessHacker.traverse.json'
+        phnt_traverse = data_dir / '0ProcessHacker.traverse.json'
         phnt_traverse.write_text(json.dumps(PHNT_TRAVERSE))
 
     # Parse
     parse_win32metadata(data_dir, args.mode)
     parse_sdk(data_dir, sdk_dir, msvc_dir, args.mode, extra_includes)
+    parse_constants(data_dir, sdk_dir)
     create_gdt(data_dir, ghidra_dir)
 
 CPP_ONLY = [
