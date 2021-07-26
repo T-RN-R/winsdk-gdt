@@ -121,9 +121,9 @@ class EnumParser(object):
 
     def __init__(self, win32md_enums_json: pathlib.Path, include_dirs: list[pathlib.Path], output_dir: pathlib.Path):
         enums_json_file = output_dir / 'parsed_enums.json'
-        #if enums_json_file.exists():
-        #    print(f"Parsed enums file {enums_json_file} already exists. Skipping parsing.")
-        #    return
+        if enums_json_file.exists():
+            print(f"Parsed enums file {enums_json_file} already exists. Skipping parsing.")
+            return
         
         print(f"Parsing enums from {win32md_enums_json}")
         self.resolved_constants = {}

@@ -36,8 +36,11 @@ from ghidra.program.model.data import FileDataTypeManager
 from ghidra.program.database.data import PointerDB
 from ghidra.program.database.data import TypedefDB
 
+from ghidra.util.task import TaskMonitor
+
 from java.io import File
 from java.lang import Exception as JavaException
+from java.lang import Class as JavaClass
 
 import xml.etree.ElementTree as ET
 
@@ -46,6 +49,7 @@ import glob
 import os
 import re
 import traceback
+import zlib
 
 from collections import defaultdict
 
@@ -79,13 +83,14 @@ GDT_TYPES = {}
 ENUM_FUNCTION_MAP = defaultdict(dict)
 ENUM_STRUCT_MAP = defaultdict(dict)
 ANON_METHOD_COUNTER = 1
+ANONYMOUS_CATEGORY_PATH = CategoryPath('/_anonymous_')
+ANONYMOUS_PREFIX = '__anon'
 
 class GdtException(Exception):
     pass
 
 class BaseType(object):
     def __init__(self, element, manager):
-        self._dataType = None
         self.element = element
         self.id = element.attrib['id']
         self.manager = manager
@@ -98,12 +103,12 @@ class BaseType(object):
         if not elementName and classType in AnonymousCounters.types:
             # Anonymous entry, check category and add to anonymous if missing
             if not self.categoryPath:
-                self.categoryPath = CategoryPath('/_anonymous_')
+                self.categoryPath = ANONYMOUS_CATEGORY_PATH
             anonId = COUNTERS.get(classType)
-            elementName = "anon_{0}_{1}".format(classType, anonId)
+            elementName = "{}_{}_{}".format(ANONYMOUS_PREFIX, classType, anonId)
             self.anonymous = True
         self.name = manager.msvc_name_fix(nsPrefix + elementName)
-        self.alignment = int(self.element.attrib.get('align', 0)) / 8            
+        self.alignment = int(self.element.attrib.get('align', 0)) / 8
 
     def align(self):
         if self.alignment:
@@ -111,7 +116,58 @@ class BaseType(object):
         else:
             self.dataType.setToDefaultAligned()
 
+    def resolveAnonymous(self, dataType, nameHint):
+        # If this type is anonymous, enrich/rename it with our data
+        concreteType = dataType
+        if isinstance(concreteType, TypedefDataType):
+            nameHint = concreteType.getName()
+            concreteType = concreteType.getBaseDataType()
+        if isinstance(concreteType, PointerDataType):
+            concreteType = concreteType.getDataType() 
+        if concreteType.getCategoryPath().getName() == ANONYMOUS_CATEGORY_PATH.getName():
+            concreteType.setCategoryPath(self.categoryPath)
+        if concreteType.getName().startswith('anon_function_'):
+            newName = nameHint + '_FnType'
+            concreteType.setName(newName)
+            GDT_TYPES[newName] = concreteType
+
+    def getDataTypeClassName(self, dataType):
+        fixup = {
+            'ghidra.program.database.data.TypedefDB': 'ghidra.program.model.data.TypedefDataType',
+            'ghidra.program.database.data.PointerDB': 'ghidra.program.model.data.PointerDataType',
+            'ghidra.program.database.data.EnumDB': 'ghidra.program.model.data.EnumDataType',
+            'ghidra.program.database.data.FunctionDefinitionDB': 'ghidra.program.model.data.FunctionDefinitionDataType',
+            'ghidra.program.database.data.StructureDB': 'ghidra.program.model.data.StructureDataType',
+            'ghidra.program.database.data.UnionDB': 'ghidra.program.model.data.UnionDataType',
+        }
+        javaClassName = JavaClass.getName(dataType.getClass())
+        return fixup.get(javaClassName, javaClassName)
+
     def save(self):
+        # Rename anonymous types with 
+        if self.name.startswith(ANONYMOUS_PREFIX):
+            # Rename based on a hash of our name+params. 
+            # Unlikely to collide based on the number of anonymous funcs..
+            newName = self.name.rsplit('_', 1)[0] + '_%08x' % (zlib.crc32(self.hash())&0xffffffff)
+            # print("Renaming {} to {}".format(self.name, newName))
+            self.name = newName
+            self.dataType.setName(self.name)
+        existingType = self.manager.checkArchiveTypes(self.categoryPath, self.dataType.getName())
+        if existingType:
+            # We're creating a type where an existing type with the same name exists in the DTM. 
+            # In order avoid true type duplication e.g. UNICODE_STRING being declared in multiple headers,
+            # replace the dataType for this internalType with theirs, and remove ourselves from the GDT.
+            # If the types don't match, we won't replace (e.g. a typedef with the same name as a struct)
+            existingTypeClassName = self.getDataTypeClassName(existingType)
+            ourTypeClassName = self.getDataTypeClassName(self.dataType)
+            print("Comparing existing class type {} with {}".format(existingTypeClassName, ourTypeClassName))
+            if existingType.getUniversalID() != self.dataType.getUniversalID() and \
+               existingTypeClassName == ourTypeClassName:
+                print("Replacing {} with {}".format(self.name, existingType.getName()))
+                monitor = TaskMonitor.DUMMY
+                self.manager.dtMgr.remove(self.dataType, monitor)
+                self.categoryPath = existingType.getCategoryPath()
+                self.dataType = existingType
         # print("Recording {} [{} bytes]".format(self.name, self.dataType.getLength()))
         self.manager.recordTypeForId(self.element.attrib['id'], self)
 
@@ -123,7 +179,7 @@ class BaseType(object):
     def resolveEnumReplacementType(self, paramDataType, enumData):
         checkType = paramDataType
         if isinstance(checkType, TypedefDataType) or isinstance(checkType, TypedefDB):
-            print("Getting base type for typedef'd {}".format(checkType.getName()))
+            # print("Getting base type for typedef'd {}".format(checkType.getName()))
             checkType = checkType.getBaseDataType()
         if isinstance(checkType, PointerDataType) or isinstance(checkType, PointerDB):
             enumType = enumData['pointer']
@@ -137,6 +193,9 @@ class BaseType(object):
                 checkType.__class__.__name__)
             )
         return enumType
+
+    def hash(self):
+        raise NotImplementedError
 
 class Array(BaseType):
     """
@@ -171,6 +230,7 @@ class Enumeration(BaseType):
         self.size = int(element.attrib["size"]) / 8
         self.dataType = EnumDataType(self.categoryPath, self.name, self.size)
         bitSize = int(element.attrib["size"])
+        self.members = []
         for enumValue in element:
             name = enumValue.attrib['name']
             init = int(enumValue.attrib['init'])
@@ -178,7 +238,14 @@ class Enumeration(BaseType):
             init = init & ((1 << bitSize) - 1)
             init = init | (-(init & (1 << (bitSize - 1))))
             self.dataType.add(name, init)
+            self.members.append((name, str(init)))
         self.save()
+
+    def hash(self):
+        enumHash = ''
+        for name, val in self.members:
+            enumHash += name + val
+        return enumHash
 
 class Function(BaseType):
     """
@@ -200,23 +267,30 @@ class Function(BaseType):
         if enumData:
             returnType = self.resolveEnumReplacementType(returnType, enumData)
         self.dataType.setReturnType(returnType)        
-        params = []
+        self.params = []
         argumentElements = element.getchildren()
         for i, argumentElement in enumerate(argumentElements):
             if argumentElement.tag == "Argument":
                 argumentName = argumentElement.attrib.get('name', "arg_" + str(i)) 
                 argumentTypeElement = manager.getElementById(argumentElement.attrib['type'])
                 paramDataType = manager.getDataType(argumentTypeElement)   
+                self.resolveAnonymous(paramDataType, "{}_{}".format(self.name, argumentName))
                 # If we know about this from our enum map, use this type
                 enumData = enumMap.get(argumentName)
                 if enumData:
                     paramDataType = self.resolveEnumReplacementType(paramDataType, enumData)
-                params.append(ParameterDefinitionImpl(argumentName, paramDataType, ""))
+                self.params.append(ParameterDefinitionImpl(argumentName, paramDataType, ""))
             elif argumentElement.tag == "Elipsis":
                 self.dataType.setVarArgs(True)
                 
-        self.dataType.setArguments(params)
+        self.dataType.setArguments(self.params)
         self.save()
+    
+    def hash(self):
+        functionHash = ''
+        for param in self.params:
+            functionHash += param.getDataType().getName() + param.getName()
+        return functionHash
 
 class Pointer(BaseType):
     """
@@ -254,6 +328,7 @@ class Union(BaseType):
         else:
             self.size = int(element.attrib["size"]) / 8
         self.flexible = False
+        self.fields = []
         if 'members' in element.attrib:
             members = element.attrib['members']
             memberIds = members.split(" ")
@@ -264,14 +339,22 @@ class Union(BaseType):
                 fieldElement = manager.getElementById(memberElement.attrib['type'])
                 fieldName = memberElement.attrib['name']
                 fieldDataType = manager.getDataType(fieldElement)
+                self.resolveAnonymous(fieldDataType, "{}_{}".format(self.name, fieldName))
                 fieldOffset = int(memberElement.attrib['offset']) / 8
                 if fieldElement.tag == "ArrayType" and 'min' in fieldElement.attrib and int(fieldElement.attrib["min"]) == 0:
                     # Set flag that specifies we contain a flexible array
                     self.flexible = True
                 self.dataType.add(fieldDataType, fieldName, hex(fieldOffset))
+                self.fields.append((fieldDataType, fieldName))
         # print("Created Union {} [{} bytes]".format(self.name, self.dataType.getLength()))
         self.pad()
         self.save()
+
+    def hash(self):
+        unionHash = ''
+        for fieldDataType, fieldName in self.fields:
+            unionHash += fieldDataType.getName() + fieldName
+        return unionHash
 
 class Typedef(BaseType):
     """
@@ -290,6 +373,7 @@ class Typedef(BaseType):
                 underlyingTypeElement.tag, underlyingTypeElement.attrib['id'])
             )
         self.dataType = TypedefDataType(self.categoryPath, self.name, underlyingDataType)
+        self.resolveAnonymous(self.dataType, self.name)
         self.save()
 
 class Structure(BaseType):
@@ -309,14 +393,16 @@ class Structure(BaseType):
         self.dataType = StructureDataType(self.categoryPath, self.name, self.size)
         # print("Created {} [{} bytes]".format(self.name, self.size))
         self.align()
-        self.save()
+        # pre-save
+        self.manager.recordTypeForId(self.element.attrib['id'], self)
         self.curBitFieldOffset = -1
         self.curBitFieldStorageSize = 0
         self.anonStructId = 0
         self.anonUnionId = 0
         self.bases = {}
         self.methods = defaultdict(list)
-        
+        self.hashFields = []
+
         # This is our name without any namespace prepended
         self.shortName = self.name
         if ">" in self.shortName:
@@ -326,8 +412,8 @@ class Structure(BaseType):
         # This is from win32metadata, it's a map to any of our members that are an opaque type
         # in the docs, but for which we've created an enumeration from #defined constants.
         enumMap = ENUM_STRUCT_MAP.get(self.shortName, {})
-        if enumMap:
-            print("Found enumMap struct entry for {}".format(self.shortName))
+        # if enumMap:
+        #     print("Found enumMap struct entry for {}".format(self.shortName))
 
         # print("Creating class {}".format(self.name))
         # Load all base classes
@@ -339,6 +425,7 @@ class Structure(BaseType):
                 # Get base information (this creates the classes if they don't already exist)
                 baseInternalType = manager.getInternalType(baseElement)
                 self.bases[baseInternalType.name] = baseInternalType
+                self.hashFields.append((baseInternalType.dataType, baseInternalType.name))
 
         hasVirtualMethods = False
         if 'members' in element.attrib:
@@ -362,6 +449,7 @@ class Structure(BaseType):
                         methodName = fieldElement.attrib['name']
                     
                     self.methods[methodName].append(methodDataType)
+                    self.hashFields.append((methodDataType, methodName))
                     hasVirtualMethods = True
                     continue
 
@@ -377,6 +465,7 @@ class Structure(BaseType):
                     arrayElement = self.manager.getElementById(typeElement.attrib['type'])
                     arrayDataType = self.manager.getDataType(arrayElement)
                     self.dataType.setFlexibleArrayComponent(arrayDataType, fieldName, hex(fieldOffset))
+                    self.hashFields.append((arrayDataType, fieldName))
                     continue
                 
                 # Non-array types
@@ -387,6 +476,7 @@ class Structure(BaseType):
                 
                 internalType = self.manager.getInternalType(typeElement)
                 fieldDataType = self.manager.getDataType(typeElement)
+                self.resolveAnonymous(fieldDataType, "{}_{}".format(self.name, fieldName))
                 if "bits" in fieldElement.attrib:
                     # Grab the storage size (in bytes) for this bitfield:
                     fieldStorageSize = fieldDataType.getLength()
@@ -418,6 +508,7 @@ class Structure(BaseType):
                         fieldName,
                         "",
                     )
+                    self.hashFields.append((fieldDataType, fieldName))
                     continue
                 
                 # This might be an unnamed struct/union:
@@ -446,13 +537,13 @@ class Structure(BaseType):
                     extraBytes = fieldDataType.getLength() - internalType.size
                     self.dataType.growStructure(extraBytes)
                 
-                
                 self.dataType.replaceAtOffset(fieldOffset, fieldDataType, fieldDataType.getLength(), fieldName, hex(fieldOffset))
-                
+                self.hashFields.append((fieldDataType, fieldName))
 
-    
         if hasVirtualMethods:
             self.manager.classes.append(self)
+        
+        self.save()
             
     def createMethod(self, element):
         global ANON_METHOD_COUNTER
@@ -471,13 +562,14 @@ class Structure(BaseType):
         methodTag = element.tag
         methodName = element.attrib.get('name', '')
         enumMap = ENUM_FUNCTION_MAP.get(methodName, {})
-        if enumMap:
-            print("Found enumMap function entry for {}".format(methodName))
+        # if enumMap:
+        #     print("Found enumMap function entry for {}".format(methodName))
         for i, argumentElement in enumerate(argumentElements):
             if argumentElement.tag == "Argument":
                 argumentName = argumentElement.attrib.get("name", "arg_" + str(i))
                 argumentTypeElement = self.manager.getElementById(argumentElement.attrib["type"])
                 paramDataType = self.manager.getDataType(argumentTypeElement)
+                self.resolveAnonymous(paramDataType, argumentName)
                 # If we know about this from our enum map, use this type
                 enumData = enumMap.get(argumentName)
                 if enumData:
@@ -500,6 +592,8 @@ class Structure(BaseType):
             + methodName
             + paramsSignature
         )
+        for param in params:
+            self.resolveAnonymous(param.getDataType(), "{}_{}".format(functionName, param.getName()))
         functionType = FunctionDefinitionDataType(self.categoryPath, functionName)
         if "returns" in element.attrib:
             returnTypeElement = self.manager.getElementById(element.attrib["returns"])
@@ -565,8 +659,17 @@ class Structure(BaseType):
                             methodDataType = self.bases[methodClass].methods[methodName][methodIdx]
                         methodPointerType = PointerDataType(methodDataType, 8)
                         vftableDataType.replaceAtOffset(methodOffset, methodPointerType, 8, methodName, "")
-                self.dataType.replaceAtOffset(offset, vftablePointerType, 8, "vftable", "")
-
+                try:
+                    self.dataType.replaceAtOffset(offset, vftablePointerType, 8, "vftable", "")
+                except Exception as e:
+                    print("Error setting vtable for {} - {}".format(self.name, e))
+                    raise(e)
+    
+    def hash(self):
+        structHash = ''
+        for fieldDataType, fieldName in self.hashFields:
+            structHash += fieldDataType.getName() + fieldName
+        return structHash
 
 class GDTTypeManager(object):
 
@@ -589,6 +692,7 @@ class GDTTypeManager(object):
         else:
             self.dtMgr = FileDataTypeManager.createFileArchive(File(outputPath))
         self.transaction = None
+        self.incompleteTypes = {}
         self.types = {}
         self.files = {}
         self.elements = {}
@@ -617,9 +721,15 @@ class GDTTypeManager(object):
             
             # Now parse elements from headers within our traverse list
             for element in sourceUnit.xmlRoot:
+                
                 # Don't parse types that aren't in our traverse list.
                 filePath = self.getFileFromId(element.attrib.get('file', ''))
                 if not filePath:
+                    continue
+
+                # Skip anonymous types, they'll get parsed if/when a containing type
+                # uses them.
+                if 'name' in element.attrib and not element.attrib['name']:
                     continue
                 
                 hdrName = self.getFileNameFromPath(filePath)
@@ -639,7 +749,7 @@ class GDTTypeManager(object):
                 self.dtMgr.resolve(internalType.dataType, DataTypeConflictHandler.KEEP_HANDLER)
                 # Add the type to the cumulative map (if it has a name and isn't anonymous)
                 if internalType.name and not internalType.anonymous:
-                    GDT_TYPES[internalType.name] = internalType.dataType.getPathName()
+                    GDT_TYPES[internalType.name] = internalType.dataType
 
             self.dtMgr.endTransaction(self.transaction, True)
             self.transaction = None
@@ -664,6 +774,7 @@ class GDTTypeManager(object):
     
     def recordTypeForId(self, id, newType):
         self.types[id] = newType
+        self.incompleteTypes[newType.name] = newType.dataType
 
     def getElementById(self, id):
         return self.elements.get(id)
@@ -773,13 +884,35 @@ class GDTTypeManager(object):
 
         return self.fundamentalTypes[typeName]
 
+    def checkArchiveTypes(self, categoryPath, elementName, strict=False):
+
+        categoryPathName = categoryPath.getName() if categoryPath else 'NOCATEGORYPATH'
+        ghidraType = None
+
+        # Is this element already in the archive?
+        if categoryPath:
+            ghidraType = self.dtMgr.getDataType(categoryPath, elementName)   
+            if ghidraType:
+                print("Found type for {} ({})".format(elementName, categoryPathName))
+
+        # Is this type duplicated in another category?
+        if not ghidraType and not strict:
+            ghidraType = GDT_TYPES.get(elementName)
+            if ghidraType:
+                print("Found duplicate type for {} (xml category {}, dt category {})".format(
+                    elementName, 
+                    categoryPathName, 
+                    ghidraType.getCategoryPath().getName())
+                )
+                        
+        return ghidraType
+
     def getInternalType(self, element):
         internalType = self.types.get(element.attrib["id"])
-        if internalType != None:
-            return internalType
-        else:
+        if not internalType:
             self.createDataType(element)
-            return self.types.get(element.attrib["id"])
+            internalType = self.types.get(element.attrib["id"])
+        return internalType
 
     def resolveNamespace(self, element, prefix=''):
         # Resolve namespace name by recursing upward
@@ -804,6 +937,17 @@ class GDTTypeManager(object):
         cname = cname.replace('__FIMapView_2_HSTRING_IInspectable_t', 'IMapView<HSTRING *, IInspectable *>')
         return cname
 
+    def getPathAndName(self, element):
+        # Construct the name we would use to save the type
+        elementName = element.attrib.get('name', '')
+        if elementName:
+            nsPrefix = self.resolveNamespace(element)
+            elementName = self.msvc_name_fix(nsPrefix + elementName)
+        # If there's a category path, we would have used that when we saved the type
+        filePath = self.getFileFromId(element.attrib.get('file', ''))
+        categoryPath = self.getCategoryPathFromFile(filePath)
+        return categoryPath, elementName
+
     def getDataType(self, element):
         """ Returns existing types or creates new ones """
         
@@ -815,23 +959,18 @@ class GDTTypeManager(object):
             # print("Returning {} for id {}".format(internalType.name, element.attrib["id"]))
             return internalType.dataType
 
-        # Do we know about this from a previous run?
-        elementName =  element.attrib.get('name', '')
+        categoryPath, elementName = self.getPathAndName(element)
         if elementName:
-            nsPrefix = self.resolveNamespace(element)
-            elementName = self.msvc_name_fix(nsPrefix + elementName)
-            typeId = GDT_TYPES.get(elementName)
-            if typeId != None:
-                ghidraType = self.dtMgr.getDataType(typeId)
-                if ghidraType == None:
-                    raise GdtException("Ghidra type for {} (id {}) is null..?".format(elementName, typeId))
-                # print("Returning stored datatype {} ({}) for element {} with id {}".format(
-                #    ghidraType.getName(),
-                #    ghidraType.__class__.__name__,
-                #    elementName, 
-                #    element.attrib["id"])
-                # )
+            # Check the archive and in-progress types
+            ghidraType = self.checkArchiveTypes(categoryPath, elementName, strict=True)
+            if ghidraType:
                 return ghidraType
+        
+            # Is it in-progress?
+            if not ghidraType:
+                ghidraType = self.incompleteTypes.get(elementName)
+                # if ghidraType:
+                #     print("Found in-progress type {}".format(elementName))
 
         # Must be a new type
         return self.createDataType(element)
@@ -958,8 +1097,11 @@ def main():
     print("Processing files in data directory: {}".format(dataDir))
     outputPath = dataDir + '/_WindowsSDK_.gdt'.format(dataDir)
     # Just append to the GDT if it already exists..
-    #if os.path.exists(outputPath):
-    #    os.unlink(outputPath)
+    if os.path.exists(outputPath):
+        # Grab all known types from the GDT by name
+        dtMgr = FileDataTypeManager.openFileArchive(File(outputPath), False)
+        for dt in dtMgr.getAllDataTypes():
+            GDT_TYPES[dt.getName()] = dt
     try:
         # Prior to parsing any of the source files, makes sure all of the enums are added
         enumsPath = dataDir + '/parsed_enums.json'
@@ -967,13 +1109,6 @@ def main():
 
         # There should be one xml and json for each processed source unit
         xmlFiles = list(glob.glob(dataDir + '/*.xml'))
-        # startUnit = 'WinProg.xml'
-        # while True:
-        #     x = xmlFiles[0]
-        #     if startUnit not in x:
-        #         xmlFiles.pop(0)
-        #         continue
-        #     break
         for xmlFile in xmlFiles:
             gdtManager = GDTTypeManager(outputPath)
             # Parse the source unit e.g. my/path/target.xml becomes target
