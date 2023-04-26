@@ -9,7 +9,7 @@ import typing
 
 SCRIPT_ROOT = pathlib.Path(__name__).parent.absolute()
 BUILD_ROOT = SCRIPT_ROOT / "build"
-ENUMS_JSON_PATH = SCRIPT_ROOT / "win32metadata/generation/scraper/enums.json"
+ENUMS_JSON_PATH = SCRIPT_ROOT / "win32metadata/generation/WinSDK/enums.json"
 
 class ConstantsException(Exception):
     pass
@@ -137,9 +137,9 @@ class EnumParser(object):
     
         # These are the headers we need to collect enums from (via win32metadata's enums.json)
         enum_entries = json.load(win32md_enums_json.open('r'))
-        enum_entries.extend(EXTRA_ENUMS)
+        enum_entries["items"].extend(EXTRA_ENUMS)
         add_uses = []
-        for enum_entry in enum_entries:
+        for enum_entry in enum_entries.get('items'):
             if enum_name := enum_entry.get('name'):
                 if enum_name in self.IGNORED_ENUMS:
                     continue
@@ -239,7 +239,11 @@ class EnumParser(object):
             [self.deferred_evaluations.pop(x) for x in found]
 
         dumped = [pe.dump() for pe in self.parsed_enums.values()]
-        json.dump(dumped, enums_json_file.open('w'), indent=2)
+        
+        print(f"CWD: {os.getcwd()}")
+
+        json.dump(dumped, enums_json_file.open('w+'), indent=2)
+
 
     def auto_populate(self, parsed_enum: ParsedEnum):
         # Check our constants for entries matching the filter
@@ -304,7 +308,7 @@ class EnumParser(object):
     def read_constants_from_headers(self, headers: list[os.PathLike]):
         all_constants = {}
         for header in headers:
-            include_raw = self.includes[header].read_text()
+            include_raw = self.includes[header].read_text(encoding="utf-8")
             constants = self.read_constants_from_lines(header, include_raw.splitlines())
             all_constants.update(constants)
         return all_constants
@@ -384,6 +388,9 @@ class EnumParser(object):
                 # Update the value
                 constant_entry['value'] = value
             return None
+        except SyntaxError as se:
+            print(se)
+            return value
         return value
 
     def fix_inconsistencies(self):

@@ -49,7 +49,8 @@ CLANG_IGNORES = [
     "-Wno-microsoft-explicit-constructor-call",
     "-Wno-deprecated-volatile",
     "-Wno-ambiguous-reversed-operator",
-    "-Wno-tautological-constant-out-of-range-compare"
+    "-Wno-tautological-constant-out-of-range-compare",
+    "-Wno-#pragma-messages",
 ]
 
 
@@ -124,13 +125,15 @@ def invoke_castxml(
         if out_file.exists() and skip_existing:
             continue
         castxml_args = f'castxml.exe --castxml-cc-msvc-c ( "{cl_bin}" "{CL_ARGS}" ) --castxml-output=1 -o "{out_file}" "{src_file}" {clang_args}'
-        print(castxml_args)
+        #print(castxml_args)
         castxml_proc = subprocess.Popen(
             shlex.split(castxml_args), stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
         castxml_out, castxml_err = castxml_proc.communicate()
-        print(str(castxml_out, encoding="utf-8") if castxml_out else "No stdout output.")
+        if castxml_out:
+            print(str(castxml_out, encoding="utf-8"))
         if castxml_err:
+            print(f"Error in {src_file}")            
             raise CastXMLException(str(castxml_err, encoding="utf-8"))
         
 def main():

@@ -14,50 +14,61 @@ import msvc
 PROJECT_NAME = 'winsdk-gdt'
 SCRIPT_ROOT = pathlib.Path(__name__).parent.absolute()
 SDK_ROOT = SCRIPT_ROOT / 'sdk'
-MD_ROOT = SCRIPT_ROOT / "win32metadata/generation/scraper/Partitions"
-ENUMS_JSON_PATH = SCRIPT_ROOT / "win32metadata/generation/scraper/enums.json"
+MD_ROOT = SCRIPT_ROOT / "win32metadata/generation/WinSDK/Partitions"
+MD_PARTITION_EXCLUDES = [
+    "Hypervisor",
+]
+MD_INC_ROOT = SCRIPT_ROOT / "win32metadata/generation/WinSDK/AdditionalHeaders"
+MD_PLUS_ROOT = SCRIPT_ROOT / "win32metadata/generation/WinSDK/AdditionalHeaders"
+ENUMS_JSON_PATH = SCRIPT_ROOT / "win32metadata/generation/WinSDK/enums.json"
 PHNT_ROOT = SCRIPT_ROOT / "processhacker/phnt/include"
 BUILD_ROOT = SCRIPT_ROOT / "build"
 CPP_MODE = 'cpp'
 C_MODE = 'c'
 CPP_SDK_DIR = 'sdk_cpp'
 C_SDK_DIR = 'sdk_c'
-
+MSC_VER = 1934
+PHNT_VERSION = 115
 BASE_C_DEFS = """\
 // Base Requirements:
 #pragma warning(disable: 4117 4005)
+#define message(ignore)
 #define _AMD64_
 #define DIRECTINPUT_VERSION 0x800
+#define SUPPRESS_LEGACY_ICU_HEADER_WARNINGS
 #include <sdkddkver.h>
 #include <stdbool.h>
 """
 
-BASE_CPP_DEFS = """\
+BASE_CPP_DEFS = f"""\
 // Base Requirements:
 #pragma warning(disable: 4117 4005)
+#define message(ignore)
 #define _AMD64_
 #define DIRECTINPUT_VERSION 0x800
 #define __STDCPP_DEFAULT_NEW_ALIGNMENT__ 16ull
 #define _MSC_EXTENSIONS 1
 #define _WCHAR_T_DEFINED
 #define _NATIVE_WCHAR_T_DEFINED
-#define __cplusplus 201711
-#define _MSVC_LANG 201402
-#define _MSC_VER 1929
+#define __cplusplus 201402  
+#define _MSVC_LANG 201402 
+#define _MSC_VER {MSC_VER}
 typedef int _Bool;
+#define SUPPRESS_LEGACY_ICU_HEADER_WARNINGS
+#undef _WINSOCK2API_ //HvSocket complains here
 #include <sdkddkver.h>
 """
 
-PHNT_CPP = """
+PHNT_CPP = f"""
 #include "_basedefs.hpp"
-#define PHNT_VERSION 111
+#define PHNT_VERSION {PHNT_VERSION}
 #include <phnt_windows.h>
 #include <phnt.h>
 """
 
-PHNT_C = """
+PHNT_C = f"""
 #include "_basedefs.h"
-#define PHNT_VERSION 111
+#define PHNT_VERSION {PHNT_VERSION}
 #include <phnt_windows.h>
 #include <phnt.h>
 """
@@ -104,8 +115,11 @@ def generate_header(folder: pathlib.Path):
     namespace = folder.stem
     cpp_file = folder / "main.cpp"
     if not cpp_file.exists():
-        raise GeneratorException(f"Missing include data for {namespace} ({folder})")
-    # print(f"Processing include data for {namespace}")
+        cpp_file = folder / "main.wontscan.cpp"
+        if not cpp_file.exists():
+            cpp_file = folder / "main.old.cpp"
+            if not cpp_file.exists():
+                raise GeneratorException(f"Missing include data for {namespace} ({folder})")
     include_data = cpp_file.read_text()
     include_data = re.sub('#include "intrinfix.h"', '', include_data)
     include_data = re.sub('"windows.fixed.h"', '<windows.h>', include_data)
@@ -141,6 +155,9 @@ def parse_win32metadata(out_path: pathlib.Path, mode: str):
             continue
         # NOTE: This isn't a C++ namespace, it's just the "API"
         namespace = child.stem
+        # Some namespaces are broken. Skip them for now.
+        if namespace in MD_PARTITION_EXCLUDES:
+            continue
 
         # This is the source file data (main.cpp in the namespace dir)
         header_data = generate_header(child)
@@ -231,6 +248,8 @@ def create_gdt(data_dir:pathlib.Path, ghidra_dir: pathlib.Path):
 
     # Ghidra 10.0.1 needs you to be in the support directory..?
     current_dir = os.getcwd()
+    print(current_dir)
+    data_dir = pathlib.Path(current_dir,data_dir)
     support_dir = ghidra_dir / 'support'
     print(support_dir)
     os.chdir(str(support_dir.absolute()))
@@ -298,7 +317,7 @@ def main():
         out_path = SDK_ROOT / sdk_dir.stem
 
     # Create output path
-    if out_path.exists():
+    if out_path.exists() and False:
         if out_path.parent.parent.stem == PROJECT_NAME:
             # Safe to delete. DEBUG: not deleting 
             # shutil.rmtree(out_path)
@@ -314,6 +333,11 @@ def main():
         data_dir = out_path / C_SDK_DIR
     data_dir.mkdir(exist_ok=True)
     extra_includes = []
+    # include the AdditionalHeaders from win32metadata
+    extra_includes.append(MD_PLUS_ROOT)
+    # include the inc from win32metadata
+    extra_includes.append(MD_INC_ROOT)
+
     if args.phnt:
         extra_includes.append(PHNT_ROOT)
         # Prepend the PH files with '_' so they get processed first instead of potentially incomplete windows types
@@ -327,8 +351,8 @@ def main():
         phnt_traverse.write_text(json.dumps(PHNT_TRAVERSE))
 
     # Parse
-    parse_win32metadata(data_dir, args.mode)
-    parse_sdk(data_dir, sdk_dir, msvc_dir, args.mode, extra_includes)
+    #parse_win32metadata(data_dir, args.mode)
+    #parse_sdk(data_dir, sdk_dir, msvc_dir, args.mode, extra_includes)
     parse_constants(data_dir, sdk_dir)
     create_gdt(data_dir, ghidra_dir)
 

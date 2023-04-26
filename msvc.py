@@ -7,10 +7,10 @@ import subprocess
 import typing
 
 from collections import defaultdict
-
-SDK_DIR = pathlib.Path(r"C:\Program Files (x86)\Windows Kits\10\Include\10.0.19041.0")
+DEFAULT_SDK_ROOT_DIR = pathlib.Path(r"C:\Program Files (x86)\Windows Kits\10\Include")
+SDK_DIR = pathlib.Path(r"C:\Program Files (x86)\Windows Kits\10\Include\10.0.22000.0")
 MSVC_DIR = pathlib.Path(
-    r"C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Tools\MSVC\14.29.30037"
+    r"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.35.32215"
 )
 CL_ARGS = [
     '/GS',
@@ -31,6 +31,7 @@ CL_ARGS = [
     '/nologo',
     '/diagnostics:column',
     '/d1reportAllClassLayout',
+    '/Wv:19.34',
 ]
 # TBD whether we should support providing the architecture?
 POINTER_SIZE = 8
@@ -133,10 +134,15 @@ def dump_class_layouts(
         if cl_err:
             raise ClException(str(cl_err, encoding="utf-8"))
         msvc_data = parse_class_layouts(cl_out)
+        import os
+
+        os.chdir("..")
         output_file.touch()
-        json.dump(msvc_data, output_file.open('w'), indent=2)
+        with open(str(output_file), "w") as f:
+            json.dump(msvc_data, f, indent=2)
         # debug file
         src_file.with_suffix('.classes.debug').write_text(str(cl_out, encoding="utf-8"))
+        os.chdir("build")
 
 def main():
     parser = argparse.ArgumentParser()

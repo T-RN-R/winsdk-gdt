@@ -464,7 +464,8 @@ class Structure(BaseType):
                 if typeElement.tag == "ArrayType" and 'min' in typeElement.attrib and int(typeElement.attrib['min']) == 0:
                     arrayElement = self.manager.getElementById(typeElement.attrib['type'])
                     arrayDataType = self.manager.getDataType(arrayElement)
-                    self.dataType.setFlexibleArrayComponent(arrayDataType, fieldName, hex(fieldOffset))
+                    self.dataType.add(ArrayDataType(arrayDataType,0,-1), fieldName,hex(fieldOffset))
+                    #self.dataType.setFlexibleArrayComponent(arrayDataType, fieldName, hex(fieldOffset))
                     self.hashFields.append((arrayDataType, fieldName))
                     continue
                 
@@ -1044,7 +1045,8 @@ def process_enums(enumsPath, outputPath):
         'ulong': 32,
         'ushort': 16,
         'short': 16,
-        'byte': 8
+        'byte': 8,
+        'sbyte': 8
     }
     # Add all of the enums to the GDT, and create a map of function_name: {param, enum} entries.
     if not os.path.exists(enumsPath):
@@ -1056,6 +1058,7 @@ def process_enums(enumsPath, outputPath):
     transaction = gdtManager.dtMgr.startTransaction("")
     for enum in enums:
         if enum['header'] == None:
+            continue
             raise GdtException("Enum {} has no header!".format(enum['name']))
         categoryPath =  CategoryPath('/' + enum['header'])
         enumBitSize = member_sizes[enum['member_type']]
@@ -1065,9 +1068,10 @@ def process_enums(enumsPath, outputPath):
         enumPointerDataType = PointerDataType(enumDataType, 8)
         for memberName, memberValue in enum['members'].items():
             # Convert to signed integer as Java cannot coerce large unsigned numbers
-            memberValue = memberValue & ((1 << enumBitSize) - 1)
-            memberValue = memberValue | (-(memberValue & (1 << (enumBitSize - 1))))
-            enumDataType.add(memberName, memberValue)
+            if  isinstance(memberValue, int): # some enums can be strings, may be un-evaluated??
+                memberValue = memberValue & ((1 << enumBitSize) - 1)
+                memberValue = memberValue | (-(memberValue & (1 << (enumBitSize - 1))))
+                enumDataType.add(memberName, memberValue)
         
         # Add the types
         gdtManager.dtMgr.resolve(enumDataType, DataTypeConflictHandler.KEEP_HANDLER)
@@ -1102,14 +1106,17 @@ def main():
         dtMgr = FileDataTypeManager.openFileArchive(File(outputPath), False)
         for dt in dtMgr.getAllDataTypes():
             GDT_TYPES[dt.getName()] = dt
+    gdtManager = None
     try:
         # Prior to parsing any of the source files, makes sure all of the enums are added
+        print(os.getcwd())
         enumsPath = dataDir + '/parsed_enums.json'
         process_enums(enumsPath, outputPath)
 
         # There should be one xml and json for each processed source unit
         xmlFiles = list(glob.glob(dataDir + '/*.xml'))
         for xmlFile in xmlFiles:
+            print(xmlFile)
             gdtManager = GDTTypeManager(outputPath)
             # Parse the source unit e.g. my/path/target.xml becomes target
             sourceUnitName = os.path.split(xmlFile)[1].rsplit('.')[0]
@@ -1117,10 +1124,14 @@ def main():
             if not os.path.exists(classesFile):
                 print("ERROR: missing expected file: {}".format(classesFile))
                 raise GdtException()
+            print("classesFile {}".format(classesFile))
+
             traverseFile = dataDir + '/{}.traverse.json'.format(sourceUnitName)
             if not os.path.exists(traverseFile):
                 print("ERROR: missing expected file: {}".format(traverseFile))
                 raise GdtException()
+            print("traverseFile {}".format(traverseFile))
+
             print("Parsing source unit: {}".format(sourceUnitName))
             sourceUnit = (SourceUnit(sourceUnitName, xmlFile, classesFile, traverseFile))
             gdtManager.parse(sourceUnit)
@@ -1128,10 +1139,12 @@ def main():
             print("Wrote data to file {}".format(outputPath))
     except Exception as e:
         print("Error parsing source units: {}".format(e))
-        gdtManager.close()
+        if gdtManager:
+            gdtManager.close()
     except JavaException as je:
         print("Java exception while parsing source units: {}".format(je))
-        gdtManager.close()
+        if gdtManager:
+            gdtManager.close()
 
 if __name__ == "__main__":
     main()
