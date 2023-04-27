@@ -317,7 +317,7 @@ def main():
         out_path = SDK_ROOT / sdk_dir.stem
 
     # Create output path
-    if out_path.exists() and False:
+    if out_path.exists():
         if out_path.parent.parent.stem == PROJECT_NAME:
             # Safe to delete. DEBUG: not deleting 
             # shutil.rmtree(out_path)
@@ -351,8 +351,8 @@ def main():
         phnt_traverse.write_text(json.dumps(PHNT_TRAVERSE))
 
     # Parse
-    #parse_win32metadata(data_dir, args.mode)
-    #parse_sdk(data_dir, sdk_dir, msvc_dir, args.mode, extra_includes)
+    parse_win32metadata(data_dir, args.mode)
+    parse_sdk(data_dir, sdk_dir, msvc_dir, args.mode, extra_includes)
     parse_constants(data_dir, sdk_dir)
     create_gdt(data_dir, ghidra_dir)
 
